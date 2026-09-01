@@ -1,8 +1,32 @@
+# Gradle
 .gradle/
 build/
+
+# Local SDK path
 local.properties
+
+# Native / CMake
+.cxx/
+.externalNativeBuild/
+
+# Android Studio / IntelliJ
 .idea/
 *.iml
-.cxx/
 captures/
+misc.xml
+deploymentTargetDropLine.xml
+deploymentTargetDropDown.xml
+render.experimental.xml
+
+# Build artifacts
+*.apk
+*.aab
+output-metadata.json
+*.log
 .DS_Store
+
+# Secrets / dumps
+*.jks
+*.keystore
+google-services.json
+*.hprof
