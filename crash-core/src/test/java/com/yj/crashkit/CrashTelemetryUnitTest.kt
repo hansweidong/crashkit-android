@@ -1,0 +1,188 @@
+package com.yj.crashkit
+
+import com.yj.crashkit.internal.TelemetryCompact
+import com.yj.crashkit.reporter.CrashReporter
+import com.yj.crashkit.reporter.TelemetryCrashReporter
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
+import org.junit.Test
+import java.io.File
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
+
+class CrashTelemetryUnitTest {
+    @Test
+    fun compactPayloadNeverExceeds9000() {
+        val dump = tempFile("long.dmp", longJavaStack(220))
+        try {
+            val record = CrashRecord(
+                "id-1",
+                CrashType.JAVA_CRASH,
+                """{"app_ver":"2.0.0","os_ver":"14","model":"Pixel 8","pkg":"com.example.app","thread_id":"12","uid":"1001","exception":"java.lang.NullPointerException: boom","history":"C:Splash -> S:Splash -> R:Splash -> C:Main -> R:Main"}""",
+                listOf(dump),
+                emptyList(),
+            )
+            val payload = CrashTelemetry.of(record)
+            assertTrue(payload.wireText.length <= CrashTelemetry.MAX_CHARS)
+            assertEquals(CrashType.JAVA_CRASH, payload.type)
+            assertEquals("id-1", payload.crashId)
+            assertTrue(payload.exception.contains("NullPointerException"))
+            assertTrue(payload.stack.contains("com.example.app.Foo.bar") || payload.wireText.contains("Foo.bar"))
+            val text = payload.wireText
+            assertTrue(text.contains("JAVA_CRASH"))
+            assertTrue(text.contains("id-1"))
+        } finally {
+            dump.delete()
+        }
+    }
+
+    @Test
+    fun frameworkFramesCollapsedButAppFrameKept() {
+        val raw = buildString {
+            appendLine("java.lang.RuntimeException: x")
+            repeat(8) { appendLine("\tat android.os.Handler.handleMessage(Handler.java:1)") }
+            repeat(30) { appendLine("\tat java.lang.Thread.run(Thread.java:1)") }
+            appendLine("\tat com.example.app.Foo.bar(Foo.java:9)")
+        }
+        val compact = TelemetryCompact.compactStack(raw, 2000)
+        assertTrue(compact.contains("RuntimeException"))
+        assertTrue(compact.contains("com.example.app.Foo.bar"))
+        assertTrue(compact.contains("fw"))
+        assertTrue(compact.length < raw.length)
+    }
+
+    @Test
+    fun nativeMapsDropped() {
+        val raw = """
+            *** CrashKit native dump ***
+            signal: 11
+            backtrace:
+              #0 pc 0x1  /data/app/libfoo.so (crash)
+              #1 pc 0x2  /system/lib64/libc.so
+            maps:
+            70e00000-70f00000 r-xp /system/lib64/libc.so
+            70f00000-71000000 r-xp /system/lib64/libart.so
+        """.trimIndent()
+        val compact = TelemetryCompact.compactStack(raw, 1500)
+        assertTrue(compact.contains("libfoo.so"))
+        assertFalse(compact.contains("libart.so"))
+        assertFalse(compact.contains("maps:"))
+    }
+
+    @Test
+    fun telemetryReporterSendsOnlyMeta() {
+        val dump = tempFile("npe.dmp", "java.lang.NullPointerException: boom\n\tat com.example.A.a(A.java:1)\n")
+        val sent = AtomicReference<String>()
+        val calls = AtomicInteger()
+        val reporter = TelemetryCrashReporter { payload, _ ->
+            calls.incrementAndGet()
+            sent.set(payload.wireText)
+        }
+        val record = CrashRecord("c1", CrashType.JAVA_CRASH, "{}", listOf(dump), emptyList())
+        var metaAck = false
+        var dumpAck = false
+        var logsAck = false
+        reporter.report(record, ReportStage.META) { metaAck = it }
+        reporter.report(record, ReportStage.DUMP) { dumpAck = it }
+        reporter.report(record, ReportStage.LOGS) { logsAck = it }
+        assertTrue(metaAck)
+        assertTrue(dumpAck)
+        assertTrue(logsAck)
+        assertEquals(1, calls.get())
+        assertTrue(sent.get().length <= CrashTelemetry.MAX_CHARS)
+        dump.delete()
+    }
+
+    @Test
+    fun configTelemetrySinkInstallsAdapterReporter() {
+        val cfg = CrashKitConfig.Builder()
+            .setTelemetrySink { _, _ -> }
+            .build()
+        assertTrue(cfg.reporter is TelemetryCrashReporter)
+        assertTrue(cfg.telemetrySink != null)
+    }
+
+    @Test
+    fun configReporterWinsOverTelemetrySink() {
+        val reporter = CrashReporter { _, _, cb -> cb.onResult(true) }
+        val cfg = CrashKitConfig.Builder()
+            .setReporter(reporter)
+            .setTelemetrySink { _, _ -> }
+            .build()
+        assertEquals(reporter, cfg.reporter)
+    }
+
+    @Test
+    fun anrTelemetryIncludesTracesAndLastMainSample() {
+        val dir = File(System.getProperty("java.io.tmpdir"), "crashkit-anr-${System.nanoTime()}")
+        assertTrue(dir.mkdirs())
+        val main = File(dir, "main_stack.txt")
+        val traces = File(dir, "traces.txt")
+        main.writeText(
+            """
+            ----- pid 1 01-01 00:00:00.000
+            Cmd line: com.example.app
+             tid=1 
+            at android.os.MessageQueue.nativePollOnce(Native Method)
+            ----- end 1
+            ----- pid 1 01-01 00:00:01.000
+            Cmd line: com.example.app
+             tid=1 
+            at com.example.app.LiveActivity.onCreate(LiveActivity.java:42)
+            at android.os.Looper.loop(Looper.java:1)
+            ----- end 1
+            """.trimIndent(),
+        )
+        traces.writeText(
+            """
+            *** CrashKit ANR traces ***
+            pid: 1 tid: 1
+            backtrace:
+              #0 pc 0xabc  /data/app/liblive.so (blockOnMain)
+              #1 pc 0xdef  /system/lib64/libc.so
+            maps:
+            70f00000-71000000 r-xp /system/lib64/libart.so
+            """.trimIndent(),
+        )
+        try {
+            val record = CrashRecord(
+                "anr-1",
+                CrashType.ANR_CRASH,
+                """{"exception":"ANR"}""",
+                listOf(main, traces),
+                emptyList(),
+            )
+            val payload = CrashTelemetry.of(record)
+            assertTrue(payload.wireText.length <= CrashTelemetry.MAX_CHARS)
+            assertEquals(CrashType.ANR_CRASH, payload.type)
+            assertTrue(payload.stack.contains("liblive.so"))
+            assertTrue(payload.stack.contains("LiveActivity"))
+            assertTrue(payload.wireText.contains("liblive.so"))
+            assertFalse("stale sampler block should be dropped", payload.stack.contains("nativePollOnce"))
+            assertFalse("maps must stay out of telemetry", payload.stack.contains("libart.so"))
+        } finally {
+            main.delete()
+            traces.delete()
+            dir.delete()
+        }
+    }
+
+    private fun tempFile(name: String, content: String): File {
+        val f = File(System.getProperty("java.io.tmpdir"), "crashkit-$name-${System.nanoTime()}")
+        f.writeText(content)
+        return f
+    }
+
+    private fun longJavaStack(frames: Int): String {
+        val sb = StringBuilder()
+        sb.append("java.lang.IllegalStateException: overflow\n")
+        for (i in 0 until frames) {
+            sb.append("\tat com.example.app.Foo.bar(Foo.java:").append(i).append(")\n")
+            sb.append("\tat android.os.Looper.loop(Looper.java:1)\n")
+        }
+        sb.append("Caused by: java.lang.NullPointerException: inner\n")
+        sb.append("\tat com.example.app.Foo.init(Foo.java:2)\n")
+        return sb.toString()
+    }
+}
