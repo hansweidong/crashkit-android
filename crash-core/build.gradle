@@ -5,7 +5,7 @@ plugins {
 }
 
 group = "com.yj.crashkit"
-version = "0.0.1"
+version = "0.0.2"
 
 android {
     namespace "com.yj.crashkit"
@@ -19,7 +19,8 @@ android {
         externalNativeBuild {
             cmake {
                 cppFlags "-std=c++17 -fvisibility=hidden"
-                arguments "-DANDROID_STL=c++_static"
+                arguments "-DANDROID_STL=c++_static",
+                        "-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON"
             }
         }
         ndk {

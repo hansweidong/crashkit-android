@@ -4,6 +4,7 @@ Android 崩溃 / ANR / OOM **采集** SDK（Kotlin + `libcrashkit.so`）。
 
 - 包名：`com.yj.crashkit`
 - 版本：`1.1.4`
+- `libcrashkit.so` 按 **16KB** 页对齐（`arm64-v8a` / `armeabi-v7a`）
 - 无快手 KOOM / xhook
 - **不含 HTTP 上报**。埋点宿主实现 `CrashTelemetrySink`；自建文件通道实现 `CrashReporter`
 
