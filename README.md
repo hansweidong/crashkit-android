@@ -3,7 +3,7 @@
 Android 崩溃 / ANR / OOM **采集** SDK（Kotlin + `libcrashkit.so`）。
 
 - 包名：`com.yj.crashkit`
-- 版本：`1.1.6`
+- 版本：`1.1.7`
 - `libcrashkit.so` 按 **16KB** 页对齐（`arm64-v8a` / `armeabi-v7a`）
 - 无快手 KOOM / xhook
 - **不含 HTTP 上报**。埋点宿主实现 `CrashTelemetrySink`；自建文件通道实现 `CrashReporter`
@@ -36,7 +36,7 @@ Android 崩溃 / ANR / OOM **采集** SDK（Kotlin + `libcrashkit.so`）。
 | `NATIVE_CRASH` | SIGSEGV / ABRT / BUS / FPE / ILL / TRAP | `libcrashkit.so` dump 后 JNI 进同一条管线 |
 | `JAVA_ERROR` | `uploadCustomCrash`，或根协程未处理异常 | 协程 **try/catch 吃掉的、async 未 await 的不会上报** |
 | `JAVA_OOM` | UEH 收到 `OutOfMemoryError`，或 `openJavaOom` 预检触发 | 线上预检**不会** dump hprof |
-| `ANR_CRASH` | `CrashKit.init` 之后 | 1s 轮询 `getProcessesInErrorState` + SIGQUIT `traces.txt` |
+| `ANR_CRASH` | `CrashKit.init` 之后 | 1s 轮询 `getProcessesInErrorState`；系统 SIGQUIT 落到 `traces.txt` 则附带。不在检测线程上自发 SIGQUIT |
 
 统一管线（顺序不可调）：`preCallback` → 落盘 → `crashCallback` → `pending/{id}.json` → META / DUMP / LOGS → `afterCallback` → Blocker。
 

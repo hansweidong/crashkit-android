@@ -1,69 +1,49 @@
 package com.yj.crashkit.anr
 
 import android.os.Looper
-import android.os.Process
 import com.yj.crashkit.util.KitLog
-import java.io.File
+import java.util.concurrent.atomic.AtomicReference
 
 /**
- * ANR 当场抓栈。不依赖主线程采样是否已 start。
+ * ANR 当场抓主线程 Java 栈。不依赖采样器，也不在检测线程上阻塞等待 SIGQUIT。
  */
 internal object AnrJavaDump {
     private const val TAG = "AnrJavaDump"
-    private const val MAX_OTHER_THREADS = 24
-    private const val MAX_OTHER_FRAMES = 8
+    private const val DUMP_TIMEOUT_MS = 200L
 
     fun capture(): String {
-        val sb = StringBuilder(4096)
-        try {
-            val main = Looper.getMainLooper().thread
-            sb.append("----- main \"").append(main.name)
-                .append("\" state=").append(main.state).append('\n')
-            appendFrames(sb, main.stackTrace, Int.MAX_VALUE)
-            val all = Thread.getAllStackTraces()
-            var n = 0
-            for ((thread, stack) in all) {
-                if (thread === main) {
-                    continue
-                }
-                if (n++ >= MAX_OTHER_THREADS) {
-                    sb.append("\n----- ... ").append(all.size - 1 - MAX_OTHER_THREADS)
-                        .append(" more threads -----\n")
-                    break
-                }
-                sb.append("\n----- \"").append(thread.name).append("\" state=")
-                    .append(thread.state).append('\n')
-                appendFrames(sb, stack, MAX_OTHER_FRAMES)
-            }
+        val main = try {
+            Looper.getMainLooper().thread
         } catch (t: Throwable) {
-            KitLog.e(TAG, "capture", t)
+            KitLog.e(TAG, "main looper", t)
+            return ""
         }
+        val sb = StringBuilder(1024)
+        sb.append("----- main \"").append(main.name)
+            .append("\" state=").append(main.state).append('\n')
+        sb.append(dumpStackTimed(main, DUMP_TIMEOUT_MS))
         return sb.toString()
     }
 
-    fun requestTraces(dumpDir: File, timeoutMs: Long = 800L): File? {
-        val f = File(dumpDir, "traces.txt")
-        if (f.exists() && f.length() > 64L) {
-            return f
-        }
-        try {
-            Process.sendSignal(Process.myPid(), Process.SIGNAL_QUIT)
-        } catch (t: Throwable) {
-            KitLog.e(TAG, "sendSignal SIGQUIT", t)
-            return if (f.exists() && f.length() > 0L) f else null
-        }
-        val deadline = System.currentTimeMillis() + timeoutMs
-        while (System.currentTimeMillis() < deadline) {
-            if (f.exists() && f.length() > 64L) {
-                return f
-            }
+    private fun dumpStackTimed(thread: Thread, timeoutMs: Long): String {
+        val result = AtomicReference<String?>(null)
+        val worker = Thread({
             try {
-                Thread.sleep(40L)
-            } catch (_: InterruptedException) {
-                break
+                val frames = StringBuilder()
+                appendFrames(frames, thread.stackTrace, Int.MAX_VALUE)
+                result.set(frames.toString())
+            } catch (t: Throwable) {
+                KitLog.e(TAG, "stackTrace", t)
+                result.set("  (dump failed)\n")
             }
+        }, "CrashKit-AnrJavaDump")
+        worker.isDaemon = true
+        worker.start()
+        try {
+            worker.join(timeoutMs)
+        } catch (_: InterruptedException) {
         }
-        return if (f.exists() && f.length() > 0L) f else null
+        return result.get() ?: "  (stack dump timed out)\n"
     }
 
     private fun appendFrames(sb: StringBuilder, stack: Array<StackTraceElement>?, max: Int) {

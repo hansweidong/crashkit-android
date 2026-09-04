@@ -95,28 +95,33 @@ class AnrDetector(
                 KitLog.e(TAG, "listener", t)
             }
         }
-        val rt = CrashKitRuntime.get()
-        val dumpDir = rt?.dumpDir ?: context.cacheDir
-        val javaStacks = AnrJavaDump.capture()
-        val sampled = MainThreadSampler.get()
-            .getThreadStackEntries(System.currentTimeMillis() - 10_000L, System.currentTimeMillis())
-        val sb = StringBuilder(javaStacks.length + 256)
-        sb.append(javaStacks)
-        if (sampled.isNotEmpty()) {
-            sb.append("\n----- sampled -----\n")
-            for (block in sampled) {
-                sb.append(block).append('\n')
-            }
-        }
-        val mainStack = DumpWriter.writeText(dumpDir, "main_stack.txt", sb.toString())
-        val longMsg = state.longMsg ?: ""
-        val errorLog = DumpWriter.writeText(dumpDir, "anr_error.log", longMsg)
         val shortMsg = if (TextUtils.isEmpty(state.shortMsg)) "ANR" else state.shortMsg
-        var traces = tracesHint
-        if (traces == null || !traces.exists() || traces.length() < 64L) {
-            traces = AnrJavaDump.requestTraces(dumpDir)
+        val dumpDir = CrashKitRuntime.get()?.dumpDir ?: context.cacheDir
+        var mainStack: File? = null
+        var errorLog: File? = null
+        val traces = tracesHint?.takeIf { it.exists() && it.length() > 64L }
+        try {
+            errorLog = DumpWriter.writeText(dumpDir, "anr_error.log", state.longMsg ?: "")
+            val javaStacks = AnrJavaDump.capture()
+            val sampled = MainThreadSampler.get()
+                .getThreadStackEntries(System.currentTimeMillis() - 10_000L, System.currentTimeMillis())
+            val sb = StringBuilder(javaStacks.length + 256)
+            sb.append(javaStacks)
+            if (sampled.isNotEmpty()) {
+                sb.append("\n----- sampled -----\n")
+                for (block in sampled) {
+                    sb.append(block).append('\n')
+                }
+            }
+            mainStack = DumpWriter.writeText(dumpDir, "main_stack.txt", sb.toString())
+        } catch (t: Throwable) {
+            KitLog.e(TAG, "dump", t)
         }
-        pipeline.handleAnr(shortMsg, mainStack, errorLog, traces, null)
+        try {
+            pipeline.handleAnr(shortMsg, mainStack, errorLog, traces, null)
+        } catch (t: Throwable) {
+            KitLog.e(TAG, "handleAnr", t)
+        }
     }
 
     private fun tracesFile(): File? {

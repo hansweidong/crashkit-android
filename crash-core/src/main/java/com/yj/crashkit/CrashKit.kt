@@ -27,7 +27,7 @@ import com.yj.crashkit.util.KitLog
  * 加重诊断（主动崩溃、53ms 采样、inline 轮询、hprof）走 [CrashKitLab]。
  */
 object CrashKit {
-    const val VERSION = "1.1.6"
+    const val VERSION = "1.1.7"
     private const val TAG = "CrashKit"
 
     private val lock = Any()
