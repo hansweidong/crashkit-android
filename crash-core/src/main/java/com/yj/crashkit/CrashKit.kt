@@ -2,6 +2,8 @@ package com.yj.crashkit
 
 import android.app.Application
 import android.content.Context
+import android.os.Handler
+import android.os.Looper
 import com.yj.crashkit.anr.AnrDetector
 import com.yj.crashkit.anr.AnrListener
 import com.yj.crashkit.anr.MainThreadSampler
@@ -25,7 +27,7 @@ import com.yj.crashkit.util.KitLog
  * 加重诊断（主动崩溃、53ms 采样、inline 轮询、hprof）走 [CrashKitLab]。
  */
 object CrashKit {
-    const val VERSION = "1.1.4"
+    const val VERSION = "1.1.5"
     private const val TAG = "CrashKit"
 
     private val lock = Any()
@@ -51,6 +53,7 @@ object CrashKit {
             if (app is Application) {
                 ActivityTracker.get().install(app)
             }
+            scheduleUehRewrap()
             val nativeOk = NativeCrashBridge.install(runtime.dumpDir.absolutePath, p)
             runtime.setCatchNative(nativeOk)
             startAnrDetectorLocked(app)
@@ -176,6 +179,19 @@ object CrashKit {
         anrDetector = detector
         detector.start()
         KitLog.i(TAG, "ANR detecting started")
+    }
+
+    /**
+     * 宿主常在 [init] 之后的同一个 Application.onCreate 里再装自己的 UEH。
+     * 投递到当前消息之后，把对方收成内层。
+     */
+    private fun scheduleUehRewrap() {
+        val looper = Looper.getMainLooper()
+        if (looper != null) {
+            Handler(looper).post { JavaCrashHandler.ensureOuter() }
+        } else {
+            JavaCrashHandler.ensureOuter()
+        }
     }
 
     @JvmStatic

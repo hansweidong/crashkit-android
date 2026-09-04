@@ -3,7 +3,7 @@
 Android 崩溃 / ANR / OOM **采集** SDK（Kotlin + `libcrashkit.so`）。
 
 - 包名：`com.yj.crashkit`
-- 版本：`1.1.4`
+- 版本：`1.1.5`
 - `libcrashkit.so` 按 **16KB** 页对齐（`arm64-v8a` / `armeabi-v7a`）
 - 无快手 KOOM / xhook
 - **不含 HTTP 上报**。埋点宿主实现 `CrashTelemetrySink`；自建文件通道实现 `CrashReporter`
@@ -32,7 +32,7 @@ Android 崩溃 / ANR / OOM **采集** SDK（Kotlin + `libcrashkit.so`）。
 
 | 类型 | 何时进管线 | 说明 |
 |---|---|---|
-| `JAVA_CRASH` | 线程未捕获异常（唯一 UEH） | Kotlin 线程未捕获同样走这里 |
+| `JAVA_CRASH` | 线程未捕获异常 | init 后若宿主再装 UEH，会重新包到最外层再回调宿主 |
 | `NATIVE_CRASH` | SIGSEGV / ABRT / BUS / FPE / ILL / TRAP | `libcrashkit.so` dump 后 JNI 进同一条管线 |
 | `JAVA_ERROR` | `uploadCustomCrash`，或根协程未处理异常 | 协程 **try/catch 吃掉的、async 未 await 的不会上报** |
 | `JAVA_OOM` | UEH 收到 `OutOfMemoryError`，或 `openJavaOom` 预检触发 | 线上预检**不会** dump hprof |
@@ -69,6 +69,8 @@ CrashKit.init(context) {
 }
 // ANR 已随 init 打开。若要采主线程栈：CrashKit.startAnrDetecting(context, 1000L)
 ```
+
+`init` 之后宿主再 `setDefaultUncaughtExceptionHandler` 可以。CrashKit 会在当前 `onCreate` 消息结束时、以及后续 Activity 生命周期里重新包到最外层，先采集再回调宿主 handler。不要要求宿主删除自己的 UEH。
 
 ### 宿主如何拿到采集结果
 
