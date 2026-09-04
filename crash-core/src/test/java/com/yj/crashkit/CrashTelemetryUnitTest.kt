@@ -136,9 +136,9 @@ class CrashTelemetryUnitTest {
         )
         traces.writeText(
             """
-            *** CrashKit ANR traces ***
-            pid: 1 tid: 1
-            backtrace:
+            ----- pid 1 at 01-01 00:00:00
+            Cmd line: com.example.app
+            "main" prio=5 tid=1 Native
               #0 pc 0xabc  /data/app/liblive.so (blockOnMain)
               #1 pc 0xdef  /system/lib64/libc.so
             maps:
@@ -161,6 +161,85 @@ class CrashTelemetryUnitTest {
             assertTrue(payload.wireText.contains("liblive.so"))
             assertFalse("stale sampler block should be dropped", payload.stack.contains("nativePollOnce"))
             assertFalse("maps must stay out of telemetry", payload.stack.contains("libart.so"))
+        } finally {
+            main.delete()
+            traces.delete()
+            dir.delete()
+        }
+    }
+
+    @Test
+    fun anrEmptySamplerBracketsAreDropped() {
+        val dir = File(System.getProperty("java.io.tmpdir"), "crashkit-anr-empty-${System.nanoTime()}")
+        assertTrue(dir.mkdirs())
+        val main = File(dir, "main_stack.txt")
+        val error = File(dir, "anr_error.log")
+        main.writeText("[]")
+        error.writeText(
+            """
+            AppFreeze! Input dispatching timed out
+            "main" prio=5 tid=1 Blocked
+              at com.example.app.SettingActivity.onCreate(SettingActivity.java:88)
+              at android.os.Looper.loop(Looper.java:1)
+            """.trimIndent(),
+        )
+        try {
+            val record = CrashRecord(
+                "anr-empty",
+                CrashType.ANR_CRASH,
+                """{"exception":"AppFreeze!"}""",
+                listOf(main),
+                listOf(error),
+            )
+            val payload = CrashTelemetry.of(record)
+            assertTrue(payload.wireText.length <= CrashTelemetry.MAX_CHARS)
+            assertFalse(payload.stack.contains("[]"))
+            assertTrue(payload.stack.contains("SettingActivity"))
+            assertTrue(payload.stack.contains("sys:"))
+            assertEquals("AppFreeze!", payload.exception)
+        } finally {
+            main.delete()
+            error.delete()
+            dir.delete()
+        }
+    }
+
+    @Test
+    fun anrLiveJavaDumpPreferredOverWatchdogNativeTraces() {
+        val dir = File(System.getProperty("java.io.tmpdir"), "crashkit-anr-live-${System.nanoTime()}")
+        assertTrue(dir.mkdirs())
+        val main = File(dir, "main_stack.txt")
+        val traces = File(dir, "traces.txt")
+        main.writeText(
+            """
+            ----- main "main" state=RUNNABLE
+              at com.example.app.DebugActivity.onClick(DebugActivity.java:17)
+              at android.os.Looper.loop(Looper.java:1)
+            ----- "OkHttp" tid=42 state=WAITING
+              at java.lang.Object.wait(Native Method)
+            """.trimIndent(),
+        )
+        traces.writeText(
+            """
+            *** CrashKit ANR traces ***
+            pid: 1 tid: 99
+            backtrace:
+              #0 pc 0xabc  /data/app/libcrashkit.so (watchdog)
+            """.trimIndent(),
+        )
+        try {
+            val record = CrashRecord(
+                "anr-live",
+                CrashType.ANR_CRASH,
+                """{"exception":"ANR"}""",
+                listOf(main, traces),
+                emptyList(),
+            )
+            val payload = CrashTelemetry.of(record)
+            assertTrue(payload.stack.contains("DebugActivity"))
+            assertTrue(payload.stack.contains("main:"))
+            assertFalse(payload.stack.contains("libcrashkit.so"))
+            assertFalse(payload.stack.contains("watchdog"))
         } finally {
             main.delete()
             traces.delete()

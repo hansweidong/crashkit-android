@@ -3,7 +3,7 @@
 Android 崩溃 / ANR / OOM **采集** SDK（Kotlin + `libcrashkit.so`）。
 
 - 包名：`com.yj.crashkit`
-- 版本：`1.1.5`
+- 版本：`1.1.6`
 - `libcrashkit.so` 按 **16KB** 页对齐（`arm64-v8a` / `armeabi-v7a`）
 - 无快手 KOOM / xhook
 - **不含 HTTP 上报**。埋点宿主实现 `CrashTelemetrySink`；自建文件通道实现 `CrashReporter`
@@ -88,7 +88,7 @@ SDK 只采集和落盘，**不会联网**。给宿主的方式就两条，选一
 `CrashTelemetryPayload` 里宿主直接能用的字段：
 
 - `crashId` / `type` / `exception` / `stack`
-- ANR 的 `stack` 已含压缩 `traces.txt`（去 maps）和最后一次 `main_stack`
+- ANR 的 `stack` 含 `anr_error.log`（华为 AppFreeze longMsg）、当场 Java 主线程栈，以及系统 traces（去 maps）。不把空的 `[]` 采样结果写进埋点
 - `wireText`：短键 JSON，≤ 9000 字符，**直接作为埋点扩展信息**
 - `record.dumpFiles` / `record.logFiles`：仅本地排障，不要打进埋点
 

@@ -60,7 +60,7 @@ class AnrDetector(
         }
         stop()
         val info = synthetic("sigquit traces")
-        dispatch(info, if (path == null) null else File(path))
+        dispatch(info, tracesHint = if (path == null) null else File(path))
     }
 
     private fun poll() {
@@ -77,7 +77,7 @@ class AnrDetector(
                         return
                     }
                     stop()
-                    dispatch(state, tracesFile())
+                    dispatch(state, tracesHint = tracesFile())
                     return
                 }
             }
@@ -86,7 +86,7 @@ class AnrDetector(
         }
     }
 
-    private fun dispatch(state: ActivityManager.ProcessErrorStateInfo, traces: File?) {
+    private fun dispatch(state: ActivityManager.ProcessErrorStateInfo, tracesHint: File?) {
         val l = listener
         if (l != null) {
             try {
@@ -97,13 +97,25 @@ class AnrDetector(
         }
         val rt = CrashKitRuntime.get()
         val dumpDir = rt?.dumpDir ?: context.cacheDir
-        val now = System.currentTimeMillis()
-        val stacks = MainThreadSampler.get()
-            .getThreadStackEntries(now - 10_000L, now).toString()
-        val mainStack = DumpWriter.writeText(dumpDir, "main_stack.txt", stacks)
+        val javaStacks = AnrJavaDump.capture()
+        val sampled = MainThreadSampler.get()
+            .getThreadStackEntries(System.currentTimeMillis() - 10_000L, System.currentTimeMillis())
+        val sb = StringBuilder(javaStacks.length + 256)
+        sb.append(javaStacks)
+        if (sampled.isNotEmpty()) {
+            sb.append("\n----- sampled -----\n")
+            for (block in sampled) {
+                sb.append(block).append('\n')
+            }
+        }
+        val mainStack = DumpWriter.writeText(dumpDir, "main_stack.txt", sb.toString())
         val longMsg = state.longMsg ?: ""
         val errorLog = DumpWriter.writeText(dumpDir, "anr_error.log", longMsg)
         val shortMsg = if (TextUtils.isEmpty(state.shortMsg)) "ANR" else state.shortMsg
+        var traces = tracesHint
+        if (traces == null || !traces.exists() || traces.length() < 64L) {
+            traces = AnrJavaDump.requestTraces(dumpDir)
+        }
         pipeline.handleAnr(shortMsg, mainStack, errorLog, traces, null)
     }
 

@@ -12,7 +12,7 @@ import java.nio.charset.Charset
  * 把一次崩溃压成埋点扩展字段。默认硬顶 [MAX_CHARS] 个 Java 字符（UTF-16 code unit）。
  *
  * 丢：logcat、userLog、maps 全文、FD 列表、全线程栈、hprof。
- * 留：压缩栈；ANR 带压缩 traces.txt（去 maps）和最后一次 main_stack 样本。
+ * 留：压缩栈；ANR 带 anr_error.log、系统 traces（去 maps）和当场 Java 主线程栈。
  */
 internal object TelemetryCompact {
     const val MAX_CHARS = 9000
@@ -74,19 +74,36 @@ internal object TelemetryCompact {
         if (record.type != CrashType.ANR_CRASH) {
             return compactStack(dump, budget)
         }
-        val tracesRaw = readBounded(findNamed(record, "traces.txt"), DUMP_READ_MAX)
-        val mainRaw = lastAnrSample(readBounded(findNamed(record, "main_stack.txt"), DUMP_READ_MAX))
-        if (tracesRaw.isEmpty() && mainRaw.isEmpty()) {
-            return compactStack(dump, budget)
-        }
-        val tracesBudget = if (mainRaw.isEmpty()) budget else (budget * 6 / 10).coerceAtLeast(budget / 3)
-        val traces = compactStack(tracesRaw, tracesBudget)
-        val remain = (budget - traces.length - 16).coerceAtLeast(
-            if (traces.isEmpty()) budget else budget / 4,
+        val sysRaw = usableAnrText(readBounded(findNamed(record, "anr_error.log"), DUMP_READ_MAX))
+        val mainFile = readBounded(findNamed(record, "main_stack.txt"), DUMP_READ_MAX)
+        val tracesRaw = usableTraces(
+            readBounded(findNamed(record, "traces.txt"), DUMP_READ_MAX),
+            hasBetterJava = usableAnrText(mainFile).isNotEmpty() || sysRaw.isNotEmpty(),
         )
+        val mainRaw = lastAnrSample(mainFile, keepAllJava = tracesRaw.isEmpty())
+        if (sysRaw.isEmpty() && tracesRaw.isEmpty() && mainRaw.isEmpty()) {
+            return compactStack(usableAnrText(dump), budget)
+        }
+        val sysBudget = if (sysRaw.isEmpty()) 0 else (budget / 5).coerceAtLeast(240)
+        val tracesBudget = if (tracesRaw.isEmpty()) {
+            0
+        } else if (mainRaw.isEmpty()) {
+            (budget - sysBudget).coerceAtLeast(budget / 3)
+        } else {
+            ((budget - sysBudget) * 5 / 10).coerceAtLeast(budget / 4)
+        }
+        val sys = compactStack(sysRaw, sysBudget)
+        val traces = compactStack(tracesRaw, tracesBudget)
+        val remain = (budget - sys.length - traces.length - 24).coerceAtLeast(budget / 5)
         val main = compactStack(mainRaw, remain)
-        val sb = StringBuilder(traces.length + main.length + 16)
+        val sb = StringBuilder(sys.length + traces.length + main.length + 24)
+        if (sys.isNotEmpty()) {
+            sb.append("sys:\n").append(sys)
+        }
         if (traces.isNotEmpty()) {
+            if (sb.isNotEmpty()) {
+                sb.append('\n')
+            }
             sb.append("traces:\n").append(traces)
         }
         if (main.isNotEmpty()) {
@@ -343,13 +360,24 @@ internal object TelemetryCompact {
 
     private fun stackRaw(record: CrashRecord): String {
         if (record.type == CrashType.ANR_CRASH) {
-            val traces = readBounded(findNamed(record, "traces.txt"), DUMP_READ_MAX)
-            val main = lastAnrSample(readBounded(findNamed(record, "main_stack.txt"), DUMP_READ_MAX))
-            if (traces.isEmpty() && main.isEmpty()) {
-                return readBounded(firstDump(record), DUMP_READ_MAX)
+            val sys = usableAnrText(readBounded(findNamed(record, "anr_error.log"), DUMP_READ_MAX))
+            val mainFile = readBounded(findNamed(record, "main_stack.txt"), DUMP_READ_MAX)
+            val traces = usableTraces(
+                readBounded(findNamed(record, "traces.txt"), DUMP_READ_MAX),
+                hasBetterJava = usableAnrText(mainFile).isNotEmpty() || sys.isNotEmpty(),
+            )
+            val main = lastAnrSample(mainFile, keepAllJava = traces.isEmpty())
+            if (sys.isEmpty() && traces.isEmpty() && main.isEmpty()) {
+                return usableAnrText(readBounded(firstDump(record), DUMP_READ_MAX))
             }
-            val sb = StringBuilder(traces.length + main.length + 16)
+            val sb = StringBuilder(sys.length + traces.length + main.length + 16)
+            if (sys.isNotEmpty()) {
+                sb.append(sys)
+            }
             if (traces.isNotEmpty()) {
+                if (sb.isNotEmpty()) {
+                    sb.append('\n')
+                }
                 sb.append(traces)
             }
             if (main.isNotEmpty()) {
@@ -363,13 +391,48 @@ internal object TelemetryCompact {
         return readBounded(firstDump(record), DUMP_READ_MAX)
     }
 
-    private fun lastAnrSample(raw: String): String {
-        if (raw.isEmpty()) {
+    private fun lastAnrSample(raw: String, keepAllJava: Boolean = false): String {
+        val text = usableAnrText(raw)
+        if (text.isEmpty()) {
             return ""
         }
+        val mainMark = "----- main "
+        val mainIdx = text.indexOf(mainMark)
+        if (mainIdx >= 0) {
+            if (keepAllJava) {
+                return text.substring(mainIdx)
+            }
+            val next = text.indexOf("\n----- ", mainIdx + mainMark.length)
+            return if (next < 0) text.substring(mainIdx) else text.substring(mainIdx, next)
+        }
+        if (keepAllJava) {
+            return text
+        }
         val marker = "----- pid "
-        val last = raw.lastIndexOf(marker)
-        return if (last < 0) raw else raw.substring(last)
+        val last = text.lastIndexOf(marker)
+        return if (last < 0) text else text.substring(last)
+    }
+
+    private fun usableAnrText(raw: String): String {
+        val t = raw.trim()
+        if (t.isEmpty() || t == "[]" || t == "main:\n[]") {
+            return ""
+        }
+        return raw
+    }
+
+    /** 本 SDK 的 native traces 是 watchdog unwind，不能定位主线程卡顿。有 Java/系统信息时丢掉。 */
+    private fun usableTraces(raw: String, hasBetterJava: Boolean): String {
+        val text = usableAnrText(raw)
+        if (text.isEmpty()) {
+            return ""
+        }
+        val kitNative = text.contains("*** CrashKit ANR traces ***")
+        val hasJavaFrames = text.contains(" at ") || text.contains("\tat ")
+        if (kitNative && !hasJavaFrames && hasBetterJava) {
+            return ""
+        }
+        return text
     }
 
     private fun firstDump(record: CrashRecord): File? {
