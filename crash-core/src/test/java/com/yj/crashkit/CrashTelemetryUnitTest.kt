@@ -95,6 +95,22 @@ class CrashTelemetryUnitTest {
     }
 
     @Test
+    fun telemetryReporterDedupesSameCrashId() {
+        val dump = tempFile("dup.dmp", "java.lang.NullPointerException: boom\n")
+        val calls = AtomicInteger()
+        val reporter = TelemetryCrashReporter { _, _ -> calls.incrementAndGet() }
+        val record = CrashRecord("same-id", CrashType.JAVA_CRASH, "{}", listOf(dump), emptyList())
+        reporter.report(record, ReportStage.META) { }
+        reporter.report(record, ReportStage.META) { }
+        reporter.report(record, ReportStage.DUMP) { }
+        assertEquals(1, calls.get())
+        val other = CrashRecord("other-id", CrashType.JAVA_CRASH, "{}", listOf(dump), emptyList())
+        reporter.report(other, ReportStage.META) { }
+        assertEquals(2, calls.get())
+        dump.delete()
+    }
+
+    @Test
     fun configTelemetrySinkInstallsAdapterReporter() {
         val cfg = CrashKitConfig.Builder()
             .setTelemetrySink { _, _ -> }
@@ -111,6 +127,50 @@ class CrashTelemetryUnitTest {
             .setTelemetrySink { _, _ -> }
             .build()
         assertEquals(reporter, cfg.reporter)
+    }
+
+    @Test
+    fun anrExceptionIsCompactMainStack() {
+        val dir = File(System.getProperty("java.io.tmpdir"), "crashkit-anr-e-${System.nanoTime()}")
+        assertTrue(dir.mkdirs())
+        val main = File(dir, "main_stack.txt")
+        main.writeText(
+            """
+            ----- main "main" state=TIMED_WAITING
+              at java.lang.Thread.sleep(Native Method)
+              at java.lang.Thread.sleep(Thread.java:443)
+              at java.lang.Thread.sleep(Thread.java:359)
+              at android.os.SystemClock.sleep(SystemClock.java:131)
+              at com.wigo.liveh5dev.DebugAnrService.onStartCommand(DebugAnrService.kt:13)
+              at android.app.ActivityThread.handleServiceArgs(ActivityThread.java:4956)
+              at android.app.ActivityThread.handleMessage(ActivityThread.java:1426)
+              at android.os.Handler.dispatchMessage(Handler.java:102)
+              at android.os.Looper.loop(Looper.java:148)
+              at android.app.ActivityThread.main(ActivityThread.java:5443)
+              at java.lang.reflect.Method.invoke(Native Method)
+              at com.android.internal.os.ZygoteInit.run(ZygoteInit.java:728)
+              at com.android.internal.os.ZygoteInit.main(ZygoteInit.java:618)
+            """.trimIndent(),
+        )
+        try {
+            val record = CrashRecord(
+                "anr-e",
+                CrashType.ANR_CRASH,
+                """{"exception":"ANR"}""",
+                listOf(main),
+                emptyList(),
+            )
+            val payload = CrashTelemetry.of(record)
+            assertTrue(payload.exception.contains("----- main \"main\" state=TIMED_WAITING"))
+            assertTrue(payload.exception.contains("DebugAnrService.onStartCommand"))
+            assertTrue(payload.exception.contains("fw"))
+            assertFalse(payload.exception.startsWith("ANR"))
+            assertTrue(payload.wireText.contains("DebugAnrService.onStartCommand"))
+            assertTrue(payload.wireText.length <= CrashTelemetry.MAX_CHARS)
+        } finally {
+            main.delete()
+            dir.delete()
+        }
     }
 
     @Test
@@ -164,6 +224,57 @@ class CrashTelemetryUnitTest {
         } finally {
             main.delete()
             traces.delete()
+            dir.delete()
+        }
+    }
+
+    @Test
+    fun anrTelemetryKeepsBlockedWorkerDropsIdlePark() {
+        val dir = File(System.getProperty("java.io.tmpdir"), "crashkit-anr-threads-${System.nanoTime()}")
+        assertTrue(dir.mkdirs())
+        val main = File(dir, "main_stack.txt")
+        val threads = File(dir, "threads.txt")
+        main.writeText(
+            """
+            ----- main "main" state=BLOCKED
+              at com.example.app.Pref.save(Pref.java:12)
+              at java.lang.Object.wait(Native Method)
+            """.trimIndent(),
+        )
+        threads.writeText(
+            """
+            java_threads=4 blocked=1 waiting=1 runnable=1
+            heap_used=10 heap_max=20
+            index:
+            "main" state=BLOCKED
+            "okhttp" state=WAITING
+            "db" state=BLOCKED
+            ----- "okhttp" tid=8 state=WAITING
+              at java.util.concurrent.locks.LockSupport.park(Native Method)
+              at okhttp3.ConnectionPool.wait(ConnectionPool.java:1)
+            ----- "db" tid=9 state=BLOCKED
+              at com.example.app.UserDao.insert(UserDao.java:40)
+              at android.database.sqlite.SQLiteDatabase.insert(SQLiteDatabase.java:1)
+            """.trimIndent(),
+        )
+        try {
+            val record = CrashRecord(
+                "anr-threads",
+                CrashType.ANR_CRASH,
+                """{"exception":"ANR"}""",
+                listOf(main, threads),
+                emptyList(),
+            )
+            val payload = CrashTelemetry.of(record)
+            assertTrue(payload.wireText.length <= CrashTelemetry.MAX_CHARS)
+            assertTrue(payload.stack.contains("Pref.save") || payload.stack.contains("main:"))
+            assertTrue(payload.stack.contains("threads:"))
+            assertTrue(payload.stack.contains("UserDao.insert"))
+            assertFalse(payload.stack.contains("LockSupport.park"))
+            assertTrue(payload.resource.contains("blocked=1"))
+        } finally {
+            main.delete()
+            threads.delete()
             dir.delete()
         }
     }

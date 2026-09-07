@@ -83,22 +83,8 @@ object MetaJson {
     }
 
     private fun processName(rt: CrashKitRuntime): String {
-        if (Build.VERSION.SDK_INT >= 28) {
-            return applicationProcessName()
-        }
-        return rt.packageName
-    }
-
-    private fun applicationProcessName(): String {
-        return try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                android.app.Application.getProcessName()
-            } else {
-                TODO("VERSION.SDK_INT < P")
-            }
-        } catch (_: Throwable) {
-            ""
-        }
+        val name = rt.processName
+        return if (name.isNotEmpty()) name else rt.packageName
     }
 
     private fun formatBeijing(ms: Long): String {

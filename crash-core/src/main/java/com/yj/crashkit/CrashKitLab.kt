@@ -11,7 +11,8 @@ import java.util.concurrent.atomic.AtomicBoolean
 /**
  * 不适合默认带上线的诊断能力。正式包不要调用 [enable]。
  *
- * 隔离内容：主动制造崩溃、低于 200ms 的主线程采样、inline `/proc` 轮询、dumpHprof。
+ * 隔离内容：主动制造崩溃、低于 200ms 的主线程采样、inline `/proc` 轮询。
+ * hprof 采集已整体下线，Lab 也拿不到（`Debug.dumpHprofData` 会 suspend 整个 VM 约 20s）。
  */
 object CrashKitLab {
     const val HIGH_FREQ_ANR_INTERVAL_MS = MainThreadSampler.HIGH_FREQ_INTERVAL_MS
@@ -47,7 +48,7 @@ object CrashKitLab {
 
     /**
      * 打开 lab 后，按 [intervalMs] 采主线程栈（可低于 200ms，例如 [HIGH_FREQ_ANR_INTERVAL_MS]）。
-     * ANR poll 已在 [CrashKit.init] 启动；若尚未 init，init 之后采样仍有效。
+     * ANR 的 SIGQUIT 旁路已在 [CrashKit.init] 启动；若尚未 init，init 之后采样仍有效。
      */
     @JvmStatic
     @JvmOverloads
@@ -82,12 +83,18 @@ object CrashKitLab {
         CrashKit.openThreadInfo(true)
     }
 
+    /**
+     * hprof 已下线：`Debug.dumpHprofData` 会 suspend 整个 VM 约 20s，几乎必然自己触发一次真 ANR。
+     * 这里只启动 OOM 预检的计数快照，等价于 [CrashKit.openJavaOom]。
+     */
+    @Deprecated(
+        message = "hprof 采集已下线，改用 CrashKit.openJavaOom(app, false)",
+        replaceWith = ReplaceWith("CrashKit.openJavaOom(application, false)"),
+    )
     @JvmStatic
     fun openJavaOomDumpHprof(application: Application?) {
-        if (!requireLab("openJavaOomDumpHprof")) {
-            return
-        }
-        CrashKit.openJavaOom(application, true)
+        KitLog.i(TAG, "hprof is retired; starting counter-only OOM watch instead")
+        CrashKit.openJavaOom(application, false)
     }
 
     internal fun requireLab(feature: String): Boolean {

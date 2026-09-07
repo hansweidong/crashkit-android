@@ -4,6 +4,7 @@ import com.yj.crashkit.CrashKit
 import com.yj.crashkit.CrashRecord
 import com.yj.crashkit.CrashTelemetryPayload
 import com.yj.crashkit.CrashType
+import com.yj.crashkit.anr.AnrJavaDump
 import org.json.JSONObject
 import java.io.File
 import java.nio.charset.Charset
@@ -11,13 +12,15 @@ import java.nio.charset.Charset
 /**
  * 把一次崩溃压成埋点扩展字段。默认硬顶 [MAX_CHARS] 个 Java 字符（UTF-16 code unit）。
  *
- * 丢：logcat、userLog、maps 全文、FD 列表、全线程栈、hprof。
- * 留：压缩栈；ANR 带 anr_error.log、系统 traces（去 maps）和当场 Java 主线程栈。
+ * 丢：logcat、userLog、maps 全文、FD 列表、hprof。
+ * 留：压缩栈；ANR 带 anr_error.log（sys）、主线程（main）、全线程里有定位价值的部分（threads）。
  */
 internal object TelemetryCompact {
     const val MAX_CHARS = 9000
     private const val DUMP_READ_MAX = 48 * 1024
     private const val EXCEPTION_MAX = 180
+    /** ANR 的 `e` 要能放下主线程头 + 前几帧 + `... Nfw`，180 会把现场截成一句 ANR。 */
+    private const val ANR_EXCEPTION_MAX = 1200
     private const val HISTORY_MAX = 96
     private const val EXT_MAX = 280
     private const val RES_MAX = 220
@@ -30,10 +33,7 @@ internal object TelemetryCompact {
         val meta = readMeta(record.metaJson)
         val dump = stackRaw(record)
         val res = clip(resourceSnippet(record), RES_MAX)
-        val exception = clip(
-            firstNonBlank(meta["exception"].orEmpty(), firstLine(dump), record.type.wireName()),
-            EXCEPTION_MAX,
-        )
+        val exception = exceptionOf(record, meta, dump)
         val history = clip(recentHistory(meta["history"].orEmpty()), HISTORY_MAX)
         val ext = clip(compactExt(meta["ext"].orEmpty()), EXT_MAX)
 
@@ -74,37 +74,32 @@ internal object TelemetryCompact {
         if (record.type != CrashType.ANR_CRASH) {
             return compactStack(dump, budget)
         }
-        val sysRaw = usableAnrText(readBounded(findNamed(record, "anr_error.log"), DUMP_READ_MAX))
-        val mainFile = readBounded(findNamed(record, "main_stack.txt"), DUMP_READ_MAX)
+        val sysRaw = usableAnrText(readBounded(findNamed(record, CrashFiles.ANR_ERROR_LOG), DUMP_READ_MAX))
+        val mainFile = readBounded(findNamed(record, CrashFiles.ANR_MAIN_STACK), DUMP_READ_MAX)
         val tracesRaw = usableTraces(
-            readBounded(findNamed(record, "traces.txt"), DUMP_READ_MAX),
+            readBounded(findNamed(record, CrashFiles.ANR_TRACES), DUMP_READ_MAX),
             hasBetterJava = usableAnrText(mainFile).isNotEmpty() || sysRaw.isNotEmpty(),
         )
-        val mainRaw = lastAnrSample(mainFile, keepAllJava = tracesRaw.isEmpty())
-        if (sysRaw.isEmpty() && tracesRaw.isEmpty() && mainRaw.isEmpty()) {
+        val threadsRaw = readBounded(findNamed(record, CrashFiles.ANR_THREADS), DUMP_READ_MAX)
+        val mainRaw = lastAnrSample(mainFile, keepAllJava = tracesRaw.isEmpty() && threadsRaw.isEmpty())
+        if (sysRaw.isEmpty() && tracesRaw.isEmpty() && mainRaw.isEmpty() && threadsRaw.isEmpty()) {
             return compactStack(usableAnrText(dump), budget)
         }
-        val sysBudget = if (sysRaw.isEmpty()) 0 else (budget / 5).coerceAtLeast(240)
-        val tracesBudget = if (tracesRaw.isEmpty()) {
+        val sysBudget = if (sysRaw.isEmpty()) 0 else (budget / 5).coerceAtLeast(280)
+        val tracesBudget = if (tracesRaw.isEmpty()) 0 else (budget / 5).coerceAtLeast(280)
+        val threadsBudget = if (threadsRaw.isEmpty()) {
             0
-        } else if (mainRaw.isEmpty()) {
-            (budget - sysBudget).coerceAtLeast(budget / 3)
         } else {
-            ((budget - sysBudget) * 5 / 10).coerceAtLeast(budget / 4)
+            ((budget - sysBudget - tracesBudget) / 2).coerceAtLeast(budget / 4)
         }
         val sys = compactStack(sysRaw, sysBudget)
         val traces = compactStack(tracesRaw, tracesBudget)
-        val remain = (budget - sys.length - traces.length - 24).coerceAtLeast(budget / 5)
+        val threads = AnrJavaDump.compactInterestingThreads(threadsRaw, threadsBudget)
+        val remain = (budget - sys.length - traces.length - threads.length - 32).coerceAtLeast(budget / 5)
         val main = compactStack(mainRaw, remain)
-        val sb = StringBuilder(sys.length + traces.length + main.length + 24)
+        val sb = StringBuilder(sys.length + traces.length + threads.length + main.length + 32)
         if (sys.isNotEmpty()) {
             sb.append("sys:\n").append(sys)
-        }
-        if (traces.isNotEmpty()) {
-            if (sb.isNotEmpty()) {
-                sb.append('\n')
-            }
-            sb.append("traces:\n").append(traces)
         }
         if (main.isNotEmpty()) {
             if (sb.isNotEmpty()) {
@@ -112,7 +107,38 @@ internal object TelemetryCompact {
             }
             sb.append("main:\n").append(main)
         }
+        if (threads.isNotEmpty()) {
+            if (sb.isNotEmpty()) {
+                sb.append('\n')
+            }
+            sb.append("threads:\n").append(threads)
+        }
+        if (traces.isNotEmpty()) {
+            if (sb.isNotEmpty()) {
+                sb.append('\n')
+            }
+            sb.append("traces:\n").append(traces)
+        }
         return if (sb.length <= budget) sb.toString() else sb.substring(0, budget)
+    }
+
+    /**
+     * ANR 的 `exception` / 埋点 `e` 用压缩后的主线程栈，方便宿主把 ANR 当一条「异常」展示。
+     * 没有 `----- main` 时退回 shortMsg（历史补报只有系统 traces 的情况）。
+     */
+    private fun exceptionOf(record: CrashRecord, meta: Map<String, String>, dump: String): String {
+        if (record.type == CrashType.ANR_CRASH) {
+            val mainFile = readBounded(findNamed(record, CrashFiles.ANR_MAIN_STACK), DUMP_READ_MAX)
+            val mainRaw = lastAnrSample(mainFile, keepAllJava = true)
+            val compact = compactStack(mainRaw, ANR_EXCEPTION_MAX)
+            if (compact.contains("----- main")) {
+                return compact
+            }
+        }
+        return clip(
+            firstNonBlank(meta["exception"].orEmpty(), firstLine(dump), record.type.wireName()),
+            EXCEPTION_MAX,
+        )
     }
 
     internal fun compactStack(raw: String, maxChars: Int): String {
@@ -360,31 +386,38 @@ internal object TelemetryCompact {
 
     private fun stackRaw(record: CrashRecord): String {
         if (record.type == CrashType.ANR_CRASH) {
-            val sys = usableAnrText(readBounded(findNamed(record, "anr_error.log"), DUMP_READ_MAX))
-            val mainFile = readBounded(findNamed(record, "main_stack.txt"), DUMP_READ_MAX)
+            val sys = usableAnrText(readBounded(findNamed(record, CrashFiles.ANR_ERROR_LOG), DUMP_READ_MAX))
+            val mainFile = readBounded(findNamed(record, CrashFiles.ANR_MAIN_STACK), DUMP_READ_MAX)
             val traces = usableTraces(
-                readBounded(findNamed(record, "traces.txt"), DUMP_READ_MAX),
+                readBounded(findNamed(record, CrashFiles.ANR_TRACES), DUMP_READ_MAX),
                 hasBetterJava = usableAnrText(mainFile).isNotEmpty() || sys.isNotEmpty(),
             )
-            val main = lastAnrSample(mainFile, keepAllJava = traces.isEmpty())
-            if (sys.isEmpty() && traces.isEmpty() && main.isEmpty()) {
+            val threads = readBounded(findNamed(record, CrashFiles.ANR_THREADS), DUMP_READ_MAX)
+            val main = lastAnrSample(mainFile, keepAllJava = traces.isEmpty() && threads.isEmpty())
+            if (sys.isEmpty() && traces.isEmpty() && main.isEmpty() && threads.isEmpty()) {
                 return usableAnrText(readBounded(firstDump(record), DUMP_READ_MAX))
             }
-            val sb = StringBuilder(sys.length + traces.length + main.length + 16)
+            val sb = StringBuilder(sys.length + traces.length + threads.length + main.length + 16)
             if (sys.isNotEmpty()) {
                 sb.append(sys)
-            }
-            if (traces.isNotEmpty()) {
-                if (sb.isNotEmpty()) {
-                    sb.append('\n')
-                }
-                sb.append(traces)
             }
             if (main.isNotEmpty()) {
                 if (sb.isNotEmpty()) {
                     sb.append('\n')
                 }
                 sb.append(main)
+            }
+            if (threads.isNotEmpty()) {
+                if (sb.isNotEmpty()) {
+                    sb.append('\n')
+                }
+                sb.append(threads)
+            }
+            if (traces.isNotEmpty()) {
+                if (sb.isNotEmpty()) {
+                    sb.append('\n')
+                }
+                sb.append(traces)
             }
             return sb.toString()
         }
@@ -399,11 +432,8 @@ internal object TelemetryCompact {
         val mainMark = "----- main "
         val mainIdx = text.indexOf(mainMark)
         if (mainIdx >= 0) {
-            if (keepAllJava) {
-                return text.substring(mainIdx)
-            }
-            val next = text.indexOf("\n----- ", mainIdx + mainMark.length)
-            return if (next < 0) text.substring(mainIdx) else text.substring(mainIdx, next)
+            val sampled = text.indexOf("\n----- sampled", mainIdx)
+            return if (sampled < 0) text.substring(mainIdx) else text.substring(mainIdx, sampled)
         }
         if (keepAllJava) {
             return text
@@ -436,7 +466,7 @@ internal object TelemetryCompact {
     }
 
     private fun firstDump(record: CrashRecord): File? {
-        val traces = findNamed(record, "traces.txt")
+        val traces = findNamed(record, CrashFiles.ANR_TRACES)
         if (traces != null) {
             return traces
         }
@@ -453,9 +483,18 @@ internal object TelemetryCompact {
     }
 
     private fun resourceSnippet(record: CrashRecord): String {
-        val oom = named(record.logFiles, "oom_lite.txt")
+        val oom = named(record.logFiles, CrashFiles.OOM_LITE)
         if (oom != null) {
             return readBounded(oom, RES_MAX * 2).replace('\n', ' ').trim()
+        }
+        if (record.type == CrashType.ANR_CRASH) {
+            val threads = readBounded(findNamed(record, CrashFiles.ANR_THREADS), 512)
+            if (threads.isNotEmpty()) {
+                val head = threads.lineSequence().take(3).joinToString(" ").trim()
+                if (head.isNotEmpty()) {
+                    return clip(head, RES_MAX)
+                }
+            }
         }
         if (record.type != CrashType.JAVA_OOM) {
             return ""

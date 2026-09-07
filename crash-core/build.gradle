@@ -4,22 +4,22 @@ plugins {
     id "maven-publish"
 }
 
-// 优先获取环境变量中的 Tag 版本，没有则从 git tag 获取
+// 调试迭代不要升小版本：crashkit.version 固定，crashkit.snapshot=true 时发布 x.y.z-SNAPSHOT（覆盖同一坐标）。
+// 正式发版把 snapshot 关掉，或用环境变量 VERSION / NO_TAG_VERSION 覆盖。
 def getLibraryVersion = { ->
     def envVersion = System.getenv("NO_TAG_VERSION") ?: System.getenv("VERSION")
     if (envVersion != null && !envVersion.isEmpty()) {
         return envVersion.replaceAll("^v", "")
     }
-    try {
-        def stdout = new ByteArrayOutputStream()
-        exec {
-            commandLine 'git', 'describe', '--tags', '--always'
-            standardOutput = stdout
-        }
-        return stdout.toString().trim().replaceAll("^v", "")
-    } catch (Exception e) {
-        return "1.0.0"
+    def prop = findProperty("crashkit.version")
+    def base = (prop != null && !prop.toString().trim().isEmpty())
+            ? prop.toString().trim()
+            : "1.4.5"
+    def snapshot = findProperty("crashkit.snapshot")?.toString()?.trim()?.toBoolean() ?: false
+    if (snapshot && !base.toUpperCase().endsWith("-SNAPSHOT")) {
+        return base + "-SNAPSHOT"
     }
+    return base
 }
 
 allprojects {
@@ -36,6 +36,8 @@ android {
         minSdk 24
         targetSdk 36
         consumerProguardFiles "consumer-rules.pro"
+        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+        buildConfigField "String", "LIBRARY_VERSION", "\"${project.version}\""
         externalNativeBuild {
             cmake {
                 cppFlags "-std=c++17 -fvisibility=hidden"
@@ -82,9 +84,16 @@ android {
 
 dependencies {
     implementation "org.jetbrains.kotlin:kotlin-stdlib:1.9.22"
+    // 只用 @RequiresApi 之类的 CLASS 保留期注解，不进运行时，不给接入方带传递依赖
+    compileOnly "androidx.annotation:annotation:1.7.1"
     compileOnly "org.jetbrains.kotlinx:kotlinx-coroutines-core:1.7.3"
     testImplementation "org.jetbrains.kotlinx:kotlinx-coroutines-core:1.7.3"
     testImplementation "junit:junit:4.13.2"
+    // android.jar 里的 org.json 在单测下是 returnDefaultValues 的桩，换成真实现才测得了序列化
+    testImplementation "org.json:json:20231013"
+    // 只进 androidTest APK，不随 release AAR 发给接入方
+    androidTestImplementation "androidx.test.ext:junit:1.1.5"
+    androidTestImplementation "androidx.test:runner:1.5.2"
 }
 
 afterEvaluate {
@@ -96,6 +105,14 @@ afterEvaluate {
                 artifactId = "crash-core"
                 version = project.version
             }
+        }
+    }
+    tasks.register("publishToLocalMaven") {
+        group = "publishing"
+        description = "Assemble release AAR and publish com.yj.crashkit:crash-core to ~/.m2"
+        dependsOn "publishReleasePublicationToMavenLocal"
+        doLast {
+            println "Published com.yj.crashkit:crash-core:${project.version} -> ~/.m2/repository/com/yj/crashkit/crash-core/${project.version}/"
         }
     }
 }

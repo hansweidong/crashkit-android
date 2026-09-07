@@ -28,6 +28,13 @@ class CrashBlocker {
         if (waiting != PREWAITING) {
             return true
         }
+        // Object.wait(0) 的语义是**无限等**，不是「不等」。ANR 的 blockerWaitMs 就是 0，
+        // 宿主 reporter 只要是异步的（不在 report() 里同步 onResult），这里会把 ANR dump
+        // 线程永久挂住，`dumping` 标志也永远放不掉，后续 SIGQUIT 全被「dump thread busy」挡掉。
+        if (waitTimeMs <= 0) {
+            waiting = UNBLOCKED
+            return true
+        }
         return try {
             waiting = WAITING
             (this as Object).wait(waitTimeMs.toLong())

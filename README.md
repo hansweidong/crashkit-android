@@ -3,7 +3,7 @@
 Android 崩溃 / ANR / OOM **采集** SDK（Kotlin + `libcrashkit.so`）。
 
 - 包名：`com.yj.crashkit`
-- 版本：`1.1.7`
+- 版本：`1.4.5-SNAPSHOT`（调试覆盖同一坐标；正式发版关掉 `crashkit.snapshot`）
 - `libcrashkit.so` 按 **16KB** 页对齐（`arm64-v8a` / `armeabi-v7a`）
 - 无快手 KOOM / xhook
 - **不含 HTTP 上报**。埋点宿主实现 `CrashTelemetrySink`；自建文件通道实现 `CrashReporter`
@@ -17,10 +17,12 @@ Android 崩溃 / ANR / OOM **采集** SDK（Kotlin + `libcrashkit.so`）。
 | | 线上正式包 | 测试 / 内部包 |
 |---|---|---|
 | 入口 | 只调 `CrashKit` | `CrashKit` + `CrashKitLab.enable()` |
-| 默认策略 | 安全档，加重诊断被钳制或跳过 | 打开 Lab 后可用高频采样、hprof、主动崩溃 |
+| 默认策略 | 安全档，加重诊断被钳制或跳过 | 打开 Lab 后可用高频采样、inline 轮询、主动崩溃 |
 | 切记 | 不要调用 `CrashKitLab.enable()` | 仅 `BuildConfig.DEBUG` 或内部渠道调用 |
 
-未 `enable()` 时：主线程采样 `<200ms` 会被钳到 200ms；`inline=true` 不轮询；`dumpHprof=true` 被忽略；`CrashKitLab` 上的测试 API 直接 return。
+未 `enable()` 时：主线程采样 `<200ms` 会被钳到 200ms；`inline=true` 不轮询；`CrashKitLab` 上的测试 API 直接 return。
+
+hprof 采集**整体下线**，Lab 也拿不到：`Debug.dumpHprofData` 会 suspend 整个 VM 约 20s，几乎必然自己触发一次真 ANR。KOOM 的 `suspend/fork/resume` 子进程 dump 需要非平凡 native 与 ART 版本适配，本 SDK 不实现。方案取舍见 [`docs/anr-oom-collection-plan.md`](docs/anr-oom-collection-plan.md)。
 
 ---
 
@@ -35,20 +37,43 @@ Android 崩溃 / ANR / OOM **采集** SDK（Kotlin + `libcrashkit.so`）。
 | `JAVA_CRASH` | 线程未捕获异常 | init 后若宿主再装 UEH，会重新包到最外层再回调宿主 |
 | `NATIVE_CRASH` | SIGSEGV / ABRT / BUS / FPE / ILL / TRAP | `libcrashkit.so` dump 后 JNI 进同一条管线 |
 | `JAVA_ERROR` | `uploadCustomCrash`，或根协程未处理异常 | 协程 **try/catch 吃掉的、async 未 await 的不会上报** |
-| `JAVA_OOM` | UEH 收到 `OutOfMemoryError`，或 `openJavaOom` 预检触发 | 线上预检**不会** dump hprof |
-| `ANR_CRASH` | `CrashKit.init` 之后 | 1s 轮询 `getProcessesInErrorState`；系统 SIGQUIT 落到 `traces.txt` 则附带。不在检测线程上自发 SIGQUIT |
+| `JAVA_OOM` | UEH 收到 `OutOfMemoryError`，或 `openJavaOom` 预检触发 | 现场走预分配缓冲落盘，不再申请内存；**从不** dump hprof |
+| `ANR_CRASH` | `CrashKit.init` 之后 | 对齐 Matrix：SIGQUIT 旁路；队头超期、主线程非 Looper 空转、或 `NOT_RESPONDING` 后上报。现场抓主线程栈 + **全线程 Java 栈**（锁/Binder/后台卡死才能定位），埋点压进 `sys` / `main` / `threads`。**只采不杀** |
+| `ANR_CRASH`（补报） | 下次冷启动，且宿主 reporter/sink 已注册 | API 30+ 读 `ApplicationExitInfo(REASON_ANR)`，补齐进程被系统直接杀掉、SIGQUIT 走不完的 fatal ANR。带系统完整 traces；和现场上报按时间戳互斥。**不触发 `CrashCallback` 三钩子**，只走 reporter/sink |
 
 统一管线（顺序不可调）：`preCallback` → 落盘 → `crashCallback` → `pending/{id}.json` → META / DUMP / LOGS → `afterCallback` → Blocker。
 
+**三段全部上报成功才删 `pending/{id}.json`**；任一段失败、或 reporter 不回调，记录就留在盘上，下次启动等宿主装好 reporter 后自动重投（只走 reporter/sink，不触发 `CrashCallback` 三钩子）。
+
+### 怎样才算「一定送到后台」
+
+投递结果由**宿主**告诉 SDK，SDK 按这个结果决定删不删 `pending`。三种接法的保证强度不同：
+
+| 接法 | 能否重投 | 说明 |
+|---|---|---|
+| `setTelemetrySink(CrashTelemetrySink)` | **不能** | `onTelemetry` 没有返回值，SDK 只能一律记成功并删掉 pending |
+| `setTelemetrySink(CrashTelemetryAckSink)` | 能 | 返回 `false` 即保留记录，下次冷启动自动重投 |
+| `setReporter(CrashReporter)` | 能 | 上报失败时 `callback.onResult(false)` |
+
+`true` 的含义是「**已确认送达，或已落到你自己的持久化队列**」。在内存入队时就返回 `true`，
+进程随后被杀同样丢数据，而且 pending 已经被删了——这时 SDK 帮不了你。
+
+ANR 的 `blockerWaitMs` 是 0（不等待）：ANR 不是 SDK 在杀进程，等待换不来任何安全边际。
+真正的兜底是 pending 重投。API 30+ 还有 `ApplicationExitInfo` 补报，**API 24–29 没有**。
+
+> `CrashKit.init` 请在**主线程**调用。ANR 旁路要在主线程解除 SIGQUIT 屏蔽，不在主线程时 SDK 会 post 回主线程，但会晚一个消息循环。
+
 附件：`.dmp` 文本栈、Java/Native 崩溃时 `logcat -t 500`（OOM/ANR 不采 logcat）、OOM 只写计数快照、可选 `/proc`（显式打开 FD/Mem/Thread 时；全线程栈仅 Lab）、userLogList、Activity history。
+
+dump 目录按进程隔离：主进程用 `cacheDir/crash`，子进程用 `cacheDir/crash/{进程段}`（`com.foo.app:push` → `push`）。`native_crash.dmp` / `anr_error.log` / `main_stack.txt` 是固定名，不分目录的话多进程会互相覆盖，`pending/` 也会串。
 
 ### 线上可开的开关
 
 | API | 线上行为 |
 |---|---|
-| `startAnrDetecting(context, 200+)` | 可选。init 已开 AM poll；本 API 只加主线程采样，间隔 **≥ 200ms** |
+| `startAnrDetecting(context, 200+)` | 可选。init 已开 SIGQUIT ANR 采集；本 API 只加主线程采样，间隔 **≥ 200ms** |
 | `openFdInfo` / `openMemInfo` / `openThreadInfo` | 崩溃瞬间读 `/proc`；线上轻量（计数/线程名），全栈/`getPss` 仅 Lab |
-| `openJavaOom(app, false)` 或 `dumpHprof=true` 但未开 Lab | 15s 看堆占比 / FD / 线程，连续 3 次超阈值上报；**不写 hprof** |
+| `openJavaOom(app)` | 5s 看堆占比 / FD / 线程 / VSS；堆判据要求**仍在上涨**（对齐 KOOM 的 gap 判据），连续 3 次命中才上报计数快照。上报前查磁盘余量，次数按版本落盘限次（3 次 / 15 天）；**不写 hprof** |
 | `setTelemetrySink` | **埋点推荐入口**。采集后同步回调一次 `CrashTelemetryPayload`（`wireText` ≤ 9000） |
 | `setReporter` / `TelemetryCrashReporter` | 高级三阶段 META/DUMP/LOGS；埋点不必自己实现 |
 | `setCrashCallback` / `setAnrListener` | 三钩子、ANR 通知 |
@@ -63,7 +88,12 @@ import com.yj.crashkit.CrashKit
 CrashKit.init(context) {
     setAppId("your-app-id")
     setGUid("guid")
+    setLogger(object : com.yj.crashkit.util.KitLog.ILog {
+        override fun i(tag: String, msg: String) { /* MLog.info(tag, msg) */ }
+        override fun e(tag: String, msg: String, t: Throwable?) { /* MLog.error(tag, msg, t) */ }
+    })
     setTelemetrySink { payload, record ->
+        // 必须在当前线程打日志/写埋点。不要 post 到主线程：ANR 时主线程已冻，日志会拖到进程被杀后才出现。
         hiidoExtra["crash"] = payload.wireText
     }
 }
@@ -72,33 +102,92 @@ CrashKit.init(context) {
 
 `init` 之后宿主再 `setDefaultUncaughtExceptionHandler` 可以。CrashKit 会在当前 `onCreate` 消息结束时、以及后续 Activity 生命周期里重新包到最外层，先采集再回调宿主 handler。不要要求宿主删除自己的 UEH。
 
+从旧 `CrashReport` 迁过来时，包名改成 `com.yj.crashkit`，其余尽量同名：`CrashKit.init(new CrashKit.CrashReportBuilder()...)`（不用 `.build()`）、`setANRListener` / `startANRDetecting` / `configCrashReport` / `openSignalReport` / `addExtraInfo` / `setAppVersion`。`ILog` 用 `KitLog.ILog`；`ANRDetector.ANRListener` 改成 `AnrListener`（不要建 `ANRDetector` 类，和 `AnrDetector` 文件名冲突）。`CatonChecker.getIns().start(53)` 必须先 `CrashKitLab.enable()`。
+
+### 发布到本地 Maven
+
+调试期 **不要升小版本号**。`crashkit.version` 固定，`crashkit.snapshot=true` 时产物永远是
+`1.4.5-SNAPSHOT`，反复 `publishToLocalMaven` 只覆盖同一坐标。正式发版把 `crashkit.snapshot` 改成 `false`。
+
+```bash
+./gradlew publishToLocalMaven
+```
+
+产物：`~/.m2/repository/com/yj/crashkit/crash-core/1.4.5-SNAPSHOT/`。
+
+宿主 `settings.gradle`：
+
+```gradle
+dependencyResolutionManagement {
+    repositories {
+        mavenLocal()
+        google()
+        mavenCentral()
+    }
+}
+```
+
+```gradle
+implementation "com.yj.crashkit:crash-core:1.4.5-SNAPSHOT"
+```
+
 ### 宿主如何拿到采集结果
 
-SDK 只采集和落盘，**不会联网**。给宿主的方式就两条，选一条：
+SDK 只采集和落盘。上报有三条路，选一条（或 sink + Wigo 上传同时开）：
 
-| | 埋点扩展字段（当前接入） | 自建 HTTP / 文件通道 |
-|---|---|---|
-| 注册 | `setTelemetrySink { payload, record -> }` | `setReporter { record, stage, cb -> }` |
-| 底层 | SDK 内部安装 `TelemetryCrashReporter` | 宿主自己实现 `CrashReporter` |
-| 回调次数 | 每个 crash/ANR/OOM **一次** | META、DUMP、LOGS **三次**，每次必须 `cb.onResult` |
-| 线程 | 崩溃线程或 ANR 检测线程，同步 | 同上 |
-| 数据 | `CrashTelemetryPayload`：结构化字段 + `wireText` | `CrashRecord`（含本地文件路径） |
-| 不要做 | 把 dump/logcat 拼进埋点 | 漏调 `onResult`（Blocker 会堵住崩溃线程） |
+| | 埋点扩展字段 | Wigo 日志协议 | 自建 HTTP / 文件通道 |
+|---|---|---|---|
+| 注册 | `setTelemetrySink { ... }` | `setWigoLogUpload(url) { WigoLogSession(...) }` | `setReporter { ... }` |
+| 数据 | `CrashTelemetryPayload.wireText` | 对齐 `LogModel.submitCrash` 的 V3 JSON | `CrashRecord` |
+| 地址 | 宿主自己的埋点 SDK | **宿主传入**，CrashKit 不明文写死域名、不做加密 | 宿主自己发 |
+
+### 按 Wigo LogModel 上报崩溃 / ANR
+
+JSON 与 `SubTypeEvent.Crash` + `LogEventArgs` 一致：
+
+- 旧 UEH：`subtype=diagnostic`，`behavior=client_crash`，`client_type=common`
+- CrashKit：`subtype=crashkit`，崩溃 `behavior=crashkit_crash`，ANR `behavior=crashkit_anr`，`client_type=crashkit`
+- data 多 `sdk=crashkit`、`sdk_ver`、`crash_id`、`crash_type`（JAVA_CRASH / ANR_CRASH / …）
+- data：`stack_trace`、`ext_data1-5`（类名 / message / cause / 首帧）、内存、`lan_id` / `sec_id`
+
+`userId`、设备 id、`lanId` 每次上报时由宿主 lambda 现取。HTTP 失败返回 `false`，pending 下次启动重投。
+
+明文接口请用 `/log/live-chat` 并把 `bodyAsListWrapper = false`（POST 数组）。走 `submitLogV3` 那条加密网关时，不要把加密 URL 直接塞进来——CrashKit 只发明文 JSON。
+
+```kotlin
+CrashKit.init(context) {
+    setAppId("wigoLive-and")
+    setWigoLogUpload("https://log.example.com/log/live-chat") {
+        WigoLogSession(
+            pkg = effectivePkg,
+            ver = versionName,
+            deviceId = deviceId,
+            userId = userId,
+            lanId = lanId,
+            secId = secId,
+            bodyAsListWrapper = false,
+        )
+    }
+}
+```
+
+init 之后仍可 `CrashKit.setWigoLogUpload(url) { ... }`（Koin / 登录态起来再装）。
+
+---
 
 `CrashTelemetryPayload` 里宿主直接能用的字段：
 
 - `crashId` / `type` / `exception` / `stack`
-- ANR 的 `stack` 含 `anr_error.log`（华为 AppFreeze longMsg）、当场 Java 主线程栈，以及系统 traces（去 maps）。不把空的 `[]` 采样结果写进埋点
+- ANR 的 `stack` 含系统 `longMsg`（`sys:`）、系统 traces（`traces:`，仅 `ApplicationExitInfo` 补报有）以及主线程快照（`main:`）。弹窗出现时在 ANR dump 线程同步回调。SDK **不杀进程**；关闭后黑屏属系统/产品侧问题，不在采集职责内
 - `wireText`：短键 JSON，≤ 9000 字符，**直接作为埋点扩展信息**
 - `record.dumpFiles` / `record.logFiles`：仅本地排障，不要打进埋点
 
-同时设置 `setReporter` 与 `setTelemetrySink` 时，以 `setReporter` 为准。init 之后仍可 `CrashKit.setTelemetrySink { ... }`。
+同时设置 `setReporter` 与 `setTelemetrySink` 时，以 `setReporter` 为准。init 之后仍可 `CrashKit.setTelemetrySink { ... }`——ANR 历史补报会挂起等到那一刻，不会被 `NoOpCrashReporter` 吃掉。
 
 ```kotlin
 CrashKit.init(context) {
     setAppId("your-app-id")
     setTelemetrySink { payload, record ->
-        // payload.wireText.length <= CrashTelemetry.MAX_CHARS
         hiidoExtra["crash"] = payload.wireText
     }
 }
@@ -124,7 +213,6 @@ if (BuildConfig.DEBUG) {
 |---|---|---|
 | `startAggressiveAnrSampling()` | 默认 53ms 采主线程栈 | ART safepoint，会抖 UI |
 | `openFdInline` / `openMemInline` / `openThreadInline` | 每 15s `getPss` + 全线程栈 + 写盘 | 稳态 CPU / 卡顿 |
-| `openJavaOomDumpHprof(app)` | 超阈值 `Debug.dumpHprofData` | 暂停整个 VM |
 | `testJavaCrash()` / `testNativeCrash()` | 主动制造崩溃 | 绝不能进正式包逻辑 |
 
 示例：
@@ -136,7 +224,6 @@ import com.yj.crashkit.CrashKitLab
 if (BuildConfig.DEBUG) {
     CrashKitLab.enable()
     CrashKitLab.startAggressiveAnrSampling()
-    CrashKitLab.openJavaOomDumpHprof(application)
 }
 ```
 
@@ -144,7 +231,8 @@ if (BuildConfig.DEBUG) {
 
 ## 明确不做
 
-- 内置崩溃后台、加密上传
+- 内置域名、密钥或加密网关（Wigo 上传只发明文 JSON，地址由宿主设置）
+- hprof 采集（含 KOOM 的 `suspend/fork/resume` 子进程 dump）与堆引用链分析
 - 快手 KOOM / xhook / 运行时 PLT hook
 - 拦截业务 `try/catch` 已消化的异常
 - 未 `await` 的 `async` 异常

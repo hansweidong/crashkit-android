@@ -25,11 +25,11 @@ data class CrashTelemetryPayload(
     val process: String,
     val threadId: String,
     val uid: String,
-    /** 异常头或 ANR shortMsg，已截断。 */
+    /** 异常头；ANR 为压缩后的主线程栈（`----- main ... state=` + 关键帧）。 */
     val exception: String,
     /**
      * 压缩栈。Java/Native 为去框架帧后的栈；
-     * ANR 为 `traces:`（SIGQUIT traces.txt，已去掉 maps）+ `main:`（最后一次主线程采样）。
+     * ANR 为 `sys:`（系统 longMsg / 计数）+ `main:`（主线程）+ `threads:`（BLOCKED / Binder / 业务线程）。
      */
     val stack: String,
     /** 最近若干 Activity 生命周期，已截断。 */

@@ -6,12 +6,14 @@ import android.os.Handler
 import android.os.Looper
 import com.yj.crashkit.anr.AnrDetector
 import com.yj.crashkit.anr.AnrListener
+import com.yj.crashkit.anr.ExitInfoAnrCollector
 import com.yj.crashkit.anr.MainThreadSampler
 import com.yj.crashkit.history.ActivityTracker
 import com.yj.crashkit.internal.CrashKitOnlinePolicy
 import com.yj.crashkit.internal.CrashKitRuntime
 import com.yj.crashkit.internal.CrashPipeline
 import com.yj.crashkit.internal.JavaCrashHandler
+import com.yj.crashkit.internal.OomLite
 import com.yj.crashkit.nativecrash.NativeCrashBridge
 import com.yj.crashkit.oom.JavaOomMonitor
 import com.yj.crashkit.reporter.CrashReporter
@@ -21,19 +23,32 @@ import com.yj.crashkit.resource.ResourceMonitor
 import com.yj.crashkit.util.KitLog
 
 /**
- * 采集入口。不含 HTTP。埋点宿主注册 [CrashTelemetrySink]；文件/自建通道实现 [CrashReporter]。
+ * 采集入口。默认不含 HTTP。埋点宿主注册 [CrashTelemetrySink]；
+ * 对齐 Wigo LogModel 的上传走 [setWigoLogUpload]（地址由宿主设置）。
  *
- * 线上请只调本对象。ANR 的 AM poll / SIGQUIT 随 [init] 打开。
+ * 线上请只调本对象。ANR 对齐 Matrix SignalAnrTracer：SIGQUIT 旁路 + 队头/AM 确认后只上报一次，**不杀进程**。
  * 加重诊断（主动崩溃、53ms 采样、inline 轮询、hprof）走 [CrashKitLab]。
  */
 object CrashKit {
-    const val VERSION = "1.1.7"
+    @JvmField
+    val VERSION: String = BuildConfig.LIBRARY_VERSION
     private const val TAG = "CrashKit"
 
     private val lock = Any()
     @Volatile private var inited = false
     @Volatile private var pipeline: CrashPipeline? = null
     @Volatile private var anrDetector: AnrDetector? = null
+
+    /** 原 `CrashReport.CrashCallback`，Java 可写 `new CrashKit.CrashCallback() {}`。 */
+    interface CrashCallback : com.yj.crashkit.CrashCallback
+
+    /** 原 `CrashReport.CrashReportBuilder`。 */
+    class CrashReportBuilder : CrashKitConfig.Builder()
+
+    @JvmStatic
+    fun init(builder: CrashKitConfig.Builder?): Boolean {
+        return init(builder?.build())
+    }
 
     @JvmStatic
     fun init(config: CrashKitConfig?): Boolean {
@@ -45,6 +60,7 @@ object CrashKit {
             }
             val app = ctx.applicationContext
             KitLog.setLogger(config.logger)
+            OomLite.preallocate()
             val runtime = CrashKitRuntime.create(app, config)
             runtime.setReporter(config.reporter ?: NoOpCrashReporter)
             val p = CrashPipeline(runtime)
@@ -57,7 +73,14 @@ object CrashKit {
             val nativeOk = NativeCrashBridge.install(runtime.dumpDir.absolutePath, p)
             runtime.setCatchNative(nativeOk)
             startAnrDetectorLocked(app)
-            KitLog.i(TAG, "init version=$VERSION native=$nativeOk dumpDir=${runtime.dumpDir}")
+            // 宿主常在 init 之后才 setTelemetrySink。这两件事都要等真正的 reporter 到位再跑，
+            // 否则数据会被 NoOpCrashReporter 吃掉，而游标 / pending 已经被清了。
+            runtime.whenReporterReady { ExitInfoAnrCollector.start(app, p) }
+            runtime.whenReporterReady { resendPendingAsync(p) }
+            KitLog.i(
+                TAG,
+                "init version=$VERSION native=$nativeOk process=${runtime.processName} dumpDir=${runtime.dumpDir}",
+            )
             inited = true
             return true
         }
@@ -91,8 +114,21 @@ object CrashKit {
         }
     }
 
+    /**
+     * 按 Wigo `LogModel.submitCrash` 协议上传崩溃 / ANR。[url] 由宿主设置，
+     * [session] 每次上报现取设备 id / userId / lanId。
+     */
     @JvmStatic
-    fun setCrashCallback(callback: CrashCallback?) {
+    @JvmOverloads
+    fun setWigoLogUpload(
+        url: String,
+        session: () -> com.yj.crashkit.log.WigoLogSession = { com.yj.crashkit.log.WigoLogSession() },
+    ) {
+        setTelemetrySink(com.yj.crashkit.log.WigoLogCrashSink(url, session))
+    }
+
+    @JvmStatic
+    fun setCrashCallback(callback: com.yj.crashkit.CrashCallback?) {
         CrashKitRuntime.get()?.setCrashCallback(callback)
     }
 
@@ -106,19 +142,61 @@ object CrashKit {
         }
     }
 
+    /** 原 `CrashReport.setANRListener`。参数用 [AnrListener]，不要再建 ANRDetector 类（与 AnrDetector 文件名冲突）。 */
+    @JvmStatic
+    fun setANRListener(listener: AnrListener?) {
+        setAnrListener(listener)
+    }
+
     @JvmStatic
     fun setUid(uid: Long) {
         CrashKitRuntime.get()?.setUid(uid)
     }
 
     @JvmStatic
-    fun setExtInfo(extInfo: Map<String, String>?) {
+    fun setAppVersion(version: String?) {
+        CrashKitRuntime.get()?.setAppVersion(version)
+    }
+
+    /** 原 `ReportUtils.setGUid` / init 之后补 hd id。 */
+    @JvmStatic
+    fun setGUid(guid: String?) {
+        CrashKitRuntime.get()?.setGUid(guid)
+    }
+
+    /** 原 `CrashReport.configCrashReport`。 */
+    @JvmStatic
+    fun configCrashReport(enabled: Boolean) {
+        setReportEnabled(enabled)
+    }
+
+    /**
+     * 原 `CrashReport.openSignalReport`。init 之后 native 已经装上；false 不会卸载 handler。
+     */
+    @JvmStatic
+    fun openSignalReport(@Suppress("UNUSED_PARAMETER") open: Boolean) {
+        KitLog.i(TAG, "openSignalReport=$open (native handler already installed at init)")
+    }
+
+    @JvmStatic
+    fun setExtInfo(extInfo: Map<String?, String?>?) {
         CrashKitRuntime.get()?.setExtInfo(extInfo)
     }
 
     @JvmStatic
-    fun addExtInfo(extInfo: Map<String, String>?) {
+    fun addExtInfo(extInfo: Map<String?, String?>?) {
         CrashKitRuntime.get()?.addExtInfo(extInfo)
+    }
+
+    @JvmStatic
+    fun addExtraInfo(extInfo: Map<String?, String?>?) {
+        addExtInfo(extInfo)
+    }
+
+    /** 原 `CrashReport.setDynamicExtInfoProvider`：崩溃瞬间再取一遍动态扩展字段。 */
+    @JvmStatic
+    fun setDynamicExtInfoProvider(provider: (() -> Map<String, String>?)?) {
+        CrashKitRuntime.get()?.setDynamicExtInfoProvider(provider)
     }
 
     @JvmStatic
@@ -143,11 +221,17 @@ object CrashKit {
     }
 
     /**
-     * 打开或加强 ANR 检测。
+     * 可选：周期性采主线程栈，供 ANR 上报附带历史样本。
      *
-     * [CrashKit.init] 已经启动 1s AM poll 和 SIGQUIT traces，不必再调本方法才能上报 ANR。
-     * 传入有限间隔时才会采主线程栈（线上不低于 200ms）。53ms 见 [CrashKitLab.startAggressiveAnrSampling]。
+     * ANR 采集已在 [init] 启动（SIGQUIT 旁路 + MessageQueue/AM 确认，再把信号交回系统）。
+     * 传入有限间隔时才会采样（线上不低于 200ms）。53ms 见 [CrashKitLab.startAggressiveAnrSampling]。
      */
+    @JvmStatic
+    @JvmOverloads
+    fun startANRDetecting(context: Context?, sampleIntervalMillis: Long = Long.MAX_VALUE) {
+        startAnrDetecting(context, sampleIntervalMillis)
+    }
+
     @JvmStatic
     @JvmOverloads
     fun startAnrDetecting(context: Context?, sampleIntervalMillis: Long = Long.MAX_VALUE) {
@@ -181,6 +265,19 @@ object CrashKit {
         KitLog.i(TAG, "ANR detecting started")
     }
 
+    /** 重投要读盘、要走 reporter，别占着 init 所在的主线程。 */
+    private fun resendPendingAsync(p: CrashPipeline) {
+        val t = Thread({
+            try {
+                p.resendPending()
+            } catch (e: Throwable) {
+                KitLog.e(TAG, "resendPending", e)
+            }
+        }, "CrashKit-Resend")
+        t.isDaemon = true
+        t.start()
+    }
+
     /**
      * 宿主常在 [init] 之后的同一个 Application.onCreate 里再装自己的 UEH。
      * 投递到当前消息之后，把对方收成内层。
@@ -198,6 +295,11 @@ object CrashKit {
     fun sampler(): MainThreadSampler = MainThreadSampler.get()
 
     @JvmStatic
+    fun uploadCustomCrash(throwable: Throwable?) {
+        uploadCustomCrash(CrashType.JAVA_ERROR, throwable)
+    }
+
+    @JvmStatic
     fun uploadCustomCrash(type: CrashType?, throwable: Throwable?) {
         pipeline?.handleCustom(type ?: CrashType.JAVA_ERROR, throwable)
     }
@@ -207,11 +309,24 @@ object CrashKit {
         pipeline?.handleCustom(type ?: CrashType.JAVA_ERROR, stack, threadId)
     }
 
+    @JvmStatic
+    fun testNativeCrash() {
+        CrashKitLab.testNativeCrash()
+    }
+
+    @JvmStatic
+    fun testJavaCrash() {
+        CrashKitLab.testJavaCrash()
+    }
+
     /**
-     * 自研 OOM 预检。线上忽略 [dumpHprof]；要 dump hprof 必须先 [CrashKitLab.enable]。
+     * OOM 预检：5s 轮询堆占比 / FD / 线程 / VSS，连续命中且堆仍在上涨才上报计数快照。
+     *
+     * [dumpHprof] 一律忽略——hprof 采集已整体下线。
      */
     @JvmStatic
-    fun openJavaOom(application: Application?, dumpHprof: Boolean) {
+    @JvmOverloads
+    fun openJavaOom(application: Application?, dumpHprof: Boolean = false) {
         val p = pipeline ?: return
         JavaOomMonitor.open(application, dumpHprof, p)
     }

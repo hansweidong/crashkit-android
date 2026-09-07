@@ -6,6 +6,7 @@ import com.yj.crashkit.CrashType
 import com.yj.crashkit.internal.CrashKitOnlinePolicy
 import com.yj.crashkit.internal.CrashKitRuntime
 import com.yj.crashkit.internal.DumpWriter
+import com.yj.crashkit.internal.OomLite
 import com.yj.crashkit.nativecrash.NativeCrashBridge
 import com.yj.crashkit.util.KitLog
 import java.io.BufferedReader
@@ -76,7 +77,8 @@ object RecordInfo {
     fun dumpForCrash(dumpDir: File, type: CrashType): List<File> {
         val files = ArrayList<File>()
         if (type == CrashType.JAVA_OOM) {
-            files.add(DumpWriter.writeText(dumpDir, "oom_lite.txt", liteOomSnapshot()))
+            // 走预分配缓冲，OOM 现场不再申请内存
+            files.add(OomLite.writeCounters(dumpDir))
             return files
         }
         val rt = CrashKitRuntime.get()
@@ -149,18 +151,7 @@ object RecordInfo {
         }
     }
 
-    internal fun liteOomSnapshot(): String {
-        val sb = StringBuilder(256)
-        val rt = Runtime.getRuntime()
-        val used = rt.totalMemory() - rt.freeMemory()
-        val max = rt.maxMemory().coerceAtLeast(1L)
-        sb.append("heap_used=").append(used).append('\n')
-        sb.append("heap_max=").append(max).append('\n')
-        sb.append("heap_ratio=").append(used.toFloat() / max.toFloat()).append('\n')
-        sb.append("fd_count=").append(countFd()).append('\n')
-        sb.append("task_count=").append(taskCount()).append('\n')
-        return sb.toString()
-    }
+    internal fun liteOomSnapshot(): String = OomLite.countersText()
 
     private fun appendHeap(sb: StringBuilder) {
         val rt = Runtime.getRuntime()
