@@ -42,4 +42,26 @@ data class CrashTelemetryPayload(
     val truncated: Boolean,
     /** 埋点扩展字段用的短键 JSON，长度 ≤ [CrashTelemetry.MAX_CHARS]。 */
     val wireText: String,
+    /** 崩溃时刻，不是上报时刻。没有则 0。 */
+    val crashTimeMs: Long = 0L,
+    /** 机身 RAM，MB。对齐旧 UEH `memory_total`。 */
+    val memoryTotal: String = "",
+    /** Java 堆已向系统申请，MB。对齐 `memory_allocate`。 */
+    val memoryAllocate: String = "",
+    /** 进程 PSS（没有则退回 Java 已用），MB。对齐旧 UEH `memory_usage`。 */
+    val memoryUsage: String = "",
+    val heapUsedMb: String = "",
+    val heapMaxMb: String = "",
+    val heapPct: String = "",
+    val pssMb: String = "",
+    val pssKb: String = "",
+    val nativeHeapKb: String = "",
+    val vmRssKb: String = "",
+    val vmSizeKb: String = "",
+    val fdCount: String = "",
+    val threadCount: String = "",
+    /** 真实进程名；[process] 兼容旧埋点，可能是包名。 */
+    val processName: String = "",
+    /** 崩溃时是否在后台。null 表示当时没记。 */
+    val isInBg: Boolean? = null,
 )

@@ -86,7 +86,7 @@ class CrashKitKotlinTest {
         val stuck = """
             ----- main "main" state=TIMED_WAITING
               at java.lang.Thread.sleep(Native Method)
-              at com.wigo.liveh5dev.DebugAnrService.onStartCommand(DebugAnrService.kt:13)
+              at com.crashkit.sample.DebugAnrService.onStartCommand(DebugAnrService.kt:13)
               at android.app.ActivityThread.handleServiceArgs(ActivityThread.java:3315)
               at android.os.Looper.loop(Looper.java:142)
         """.trimIndent()

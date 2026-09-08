@@ -24,7 +24,7 @@ internal object TelemetryCompact {
     private const val HISTORY_MAX = 96
     private const val EXT_MAX = 280
     private const val RES_MAX = 220
-    private const val HEADER_RESERVE = 720
+    private const val HEADER_RESERVE = 860
     private const val MAX_FRAMES = 36
     private const val KEEP_HEAD_FRAMES = 6
 
@@ -228,6 +228,8 @@ internal object TelemetryCompact {
         val process = meta["pkg"].orEmpty().ifEmpty { meta["process"].orEmpty() }
         val threadId = meta["thread_id"].orEmpty()
         val uid = meta["uid"].orEmpty()
+        val mem = MemSnapshot.fromMeta(meta, res)
+        val processName = meta["process"].orEmpty()
         val wire = encode(
             id = record.crashId,
             type = record.type,
@@ -244,6 +246,7 @@ internal object TelemetryCompact {
             res = res,
             stack = stack,
             cut = cut,
+            mem = mem,
         )
         return CrashTelemetryPayload(
             crashId = record.crashId,
@@ -262,6 +265,22 @@ internal object TelemetryCompact {
             resource = res,
             truncated = cut,
             wireText = wire,
+            crashTimeMs = mem.crashTimeMs,
+            memoryTotal = mem.totalMb,
+            memoryAllocate = mem.javaAllocMb,
+            memoryUsage = MemSnapshot.usageMb(mem),
+            heapUsedMb = mem.javaUsedMb,
+            heapMaxMb = mem.javaMaxMb,
+            heapPct = mem.heapPct,
+            pssMb = mem.pssMb,
+            pssKb = mem.pssKb,
+            nativeHeapKb = mem.nativeHeapKb,
+            vmRssKb = mem.vmRssKb,
+            vmSizeKb = mem.vmSizeKb,
+            fdCount = mem.fd,
+            threadCount = mem.threads,
+            processName = processName,
+            isInBg = mem.inBg,
         )
     }
 
@@ -281,8 +300,9 @@ internal object TelemetryCompact {
         res: String,
         stack: String,
         cut: Boolean,
+        mem: MemSnapshot.Snapshot,
     ): String {
-        val sb = StringBuilder(stack.length + 512)
+        val sb = StringBuilder(stack.length + 640)
         sb.append('{')
         fun field(key: String, value: String) {
             if (value.isEmpty()) {
@@ -310,6 +330,15 @@ internal object TelemetryCompact {
         if (cut) {
             field("cut", "1")
         }
+        if (mem.crashTimeMs > 0L) {
+            field("ct", mem.crashTimeMs.toString())
+        }
+        field("mt", mem.totalMb)
+        field("ma", mem.javaAllocMb)
+        field("mu", MemSnapshot.usageMb(mem))
+        field("hp", mem.heapPct)
+        field("pss", mem.pssMb)
+        field("rss", mem.vmRssKb)
         sb.append('}')
         return sb.toString()
     }
@@ -318,7 +347,15 @@ internal object TelemetryCompact {
         val out = HashMap<String, String>()
         try {
             val o = JSONObject(json)
-            copy(o, out, "app_ver", "os_ver", "model", "pkg", "process", "thread_id", "uid", "guid", "history", "exception")
+            copy(
+                o,
+                out,
+                "app_ver", "os_ver", "model", "pkg", "process", "thread_id", "uid", "guid",
+                "history", "exception", "crash_time_ms", "launch_time_ms", "is_in_bg",
+                "mem_total_mb", "mem_java_used_mb", "mem_java_alloc_mb", "mem_java_max_mb",
+                "heap_pct", "mem_pss_mb", "mem_pss_kb", "mem_native_kb",
+                "vm_rss_kb", "vm_size_kb", "fd_count", "thread_count",
+            )
             val ext = o.optJSONObject("ext")
             if (ext != null) {
                 out["ext"] = ext.toString()
@@ -333,6 +370,10 @@ internal object TelemetryCompact {
         val keys = arrayOf(
             "app_ver", "os_ver", "model", "pkg", "process",
             "thread_id", "uid", "guid", "history", "exception",
+            "crash_time_ms", "launch_time_ms", "is_in_bg",
+            "mem_total_mb", "mem_java_used_mb", "mem_java_alloc_mb", "mem_java_max_mb",
+            "heap_pct", "mem_pss_mb", "mem_pss_kb", "mem_native_kb",
+            "vm_rss_kb", "vm_size_kb", "fd_count", "thread_count",
         )
         for (key in keys) {
             val value = scanJsonString(json, key)

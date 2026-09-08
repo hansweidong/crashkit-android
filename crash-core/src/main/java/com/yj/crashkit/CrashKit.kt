@@ -24,7 +24,7 @@ import com.yj.crashkit.util.KitLog
 
 /**
  * 采集入口。默认不含 HTTP。埋点宿主注册 [CrashTelemetrySink]；
- * 对齐 Wigo LogModel 的上传走 [setWigoLogUpload]（地址由宿主设置）。
+ * CrashKit 日志协议 JSON 由 [setCrashKitLogUpload] 组好后交给宿主网络栈发送。
  *
  * 线上请只调本对象。ANR 对齐 Matrix SignalAnrTracer：SIGQUIT 旁路 + 队头/AM 确认后只上报一次，**不杀进程**。
  * 加重诊断（主动崩溃、53ms 采样、inline 轮询、hprof）走 [CrashKitLab]。
@@ -115,16 +115,16 @@ object CrashKit {
     }
 
     /**
-     * 按 Wigo `LogModel.submitCrash` 协议上传崩溃 / ANR。[url] 由宿主设置，
-     * [session] 每次上报现取设备 id / userId / lanId。
+     * 组 JSON 后由 [send] 走宿主网络发出去。CrashKit 不开连接。
+     * [session] 每次上报现取设备 id / userId / lanId，以及信封 `log_type` / `subtype` / `behavior`。
      */
     @JvmStatic
     @JvmOverloads
-    fun setWigoLogUpload(
-        url: String,
-        session: () -> com.yj.crashkit.log.WigoLogSession = { com.yj.crashkit.log.WigoLogSession() },
+    fun setCrashKitLogUpload(
+        send: com.yj.crashkit.log.CrashKitLogTransport,
+        session: () -> com.yj.crashkit.log.CrashKitLogSession = { com.yj.crashkit.log.CrashKitLogSession.Default },
     ) {
-        setTelemetrySink(com.yj.crashkit.log.WigoLogCrashSink(url, session))
+        setTelemetrySink(com.yj.crashkit.log.CrashKitLogCrashSink(session, send))
     }
 
     @JvmStatic

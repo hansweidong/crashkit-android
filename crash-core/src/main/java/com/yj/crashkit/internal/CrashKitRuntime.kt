@@ -66,6 +66,7 @@ class CrashKitRuntime private constructor(app: Context, config: CrashKitConfig) 
         }
         dumpDir = dir
         PendingStore.prune(dir)
+        MemSnapshot.deviceTotalMb()
     }
 
     fun setReporter(r: CrashReporter?) {

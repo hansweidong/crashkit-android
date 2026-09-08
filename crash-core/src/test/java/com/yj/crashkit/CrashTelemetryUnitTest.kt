@@ -141,7 +141,7 @@ class CrashTelemetryUnitTest {
               at java.lang.Thread.sleep(Thread.java:443)
               at java.lang.Thread.sleep(Thread.java:359)
               at android.os.SystemClock.sleep(SystemClock.java:131)
-              at com.wigo.liveh5dev.DebugAnrService.onStartCommand(DebugAnrService.kt:13)
+              at com.crashkit.sample.DebugAnrService.onStartCommand(DebugAnrService.kt:13)
               at android.app.ActivityThread.handleServiceArgs(ActivityThread.java:4956)
               at android.app.ActivityThread.handleMessage(ActivityThread.java:1426)
               at android.os.Handler.dispatchMessage(Handler.java:102)

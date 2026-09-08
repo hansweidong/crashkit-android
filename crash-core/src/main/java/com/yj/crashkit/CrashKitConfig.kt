@@ -27,8 +27,8 @@ class CrashKitConfig private constructor(
         private var loggerField: KitLog.ILog? = null
         private var reporterField: CrashReporter? = null
         private var telemetrySinkField: CrashTelemetrySink? = null
-        private var wigoLogUrlField: String? = null
-        private var wigoLogSessionField: (() -> com.yj.crashkit.log.WigoLogSession)? = null
+        private var crashKitLogSendField: com.yj.crashkit.log.CrashKitLogTransport? = null
+        private var crashKitLogSessionField: (() -> com.yj.crashkit.log.CrashKitLogSession)? = null
 
         fun setContext(context: Context) = apply { contextField = context }
         fun setAppId(appId: String?) = apply { appIdField = appId }
@@ -53,29 +53,26 @@ class CrashKitConfig private constructor(
         fun setTelemetrySink(sink: CrashTelemetrySink?) = apply { telemetrySinkField = sink }
 
         /**
-         * 按 Wigo `LogModel.submitCrash` 的协议把崩溃 / ANR POST 到 [url]。
-         * 运行时字段（设备 id、userId、lanId）每次上报时调用 [session] 现取。
-         * 与 [setTelemetrySink] 同时设置时，先回调 sink，再上传；上传失败会保留 pending。
+         * 组 JSON 后由 [send] 走宿主网络发出去。
+         * 运行时字段（设备 id、userId、lanId）以及信封分类字段每次上报时调用 [session] 现取。
+         * 与 [setTelemetrySink] 同时设置时，先回调 sink，再交给宿主发送；发送失败会保留 pending。
          */
-        fun setWigoLogUpload(
-            url: String,
-            session: () -> com.yj.crashkit.log.WigoLogSession = { com.yj.crashkit.log.WigoLogSession() },
+        fun setCrashKitLogUpload(
+            send: com.yj.crashkit.log.CrashKitLogTransport,
+            session: () -> com.yj.crashkit.log.CrashKitLogSession = { com.yj.crashkit.log.CrashKitLogSession.Default },
         ) = apply {
-            wigoLogUrlField = url
-            wigoLogSessionField = session
+            crashKitLogSendField = send
+            crashKitLogSessionField = session
         }
 
         fun build(): CrashKitConfig {
-            val wigoUrl = wigoLogUrlField?.trim().orEmpty()
-            val wigoSink = if (wigoUrl.isEmpty()) {
-                null
-            } else {
-                com.yj.crashkit.log.WigoLogCrashSink(
-                    wigoUrl,
-                    wigoLogSessionField ?: { com.yj.crashkit.log.WigoLogSession() },
+            val crashKitSink = crashKitLogSendField?.let { send ->
+                com.yj.crashkit.log.CrashKitLogCrashSink(
+                    crashKitLogSessionField ?: { com.yj.crashkit.log.CrashKitLogSession.Default },
+                    send,
                 )
             }
-            val sink = composeSink(telemetrySinkField, wigoSink)
+            val sink = composeSink(telemetrySinkField, crashKitSink)
             val reporter = when {
                 reporterField != null -> reporterField
                 sink != null -> TelemetryCrashReporter(sink)
@@ -98,12 +95,12 @@ class CrashKitConfig private constructor(
 
 private fun composeSink(
     host: CrashTelemetrySink?,
-    wigo: CrashTelemetryAckSink?,
+    crashKitLog: CrashTelemetryAckSink?,
 ): CrashTelemetrySink? {
     if (host == null) {
-        return wigo
+        return crashKitLog
     }
-    if (wigo == null) {
+    if (crashKitLog == null) {
         return host
     }
     return CrashTelemetryAckSink { payload, record ->
@@ -113,7 +110,7 @@ private fun composeSink(
             host.onTelemetry(payload, record)
             true
         }
-        val uploadOk = wigo.onTelemetryAck(payload, record)
+        val uploadOk = crashKitLog.onTelemetryAck(payload, record)
         hostOk && uploadOk
     }
 }

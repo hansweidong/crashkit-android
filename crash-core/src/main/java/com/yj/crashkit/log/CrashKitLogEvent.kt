@@ -6,24 +6,19 @@ import com.yj.crashkit.CrashTelemetryPayload
 import com.yj.crashkit.CrashType
 import com.yj.crashkit.history.ActivityTracker
 import com.yj.crashkit.internal.CrashKitRuntime
+import com.yj.crashkit.internal.MemSnapshot
 import org.json.JSONArray
 import org.json.JSONObject
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
- * 把 CrashKit 采集结果编成 Wigo 日志 V3 JSON，**字段集合对齐** `LogModel.buildCrashEvent`，
- * **事件名与旧 UEH 上报刻意分开**，避免和 `behavior=client_crash` / `subtype=diagnostic` 混在一张表里。
+ * 把 CrashKit 采集结果编成日志 JSON。信封分类字段（`log_type` / `subtype` / `behavior`）
+ * 优先使用 [CrashKitLogSession] 里宿主传入的值；未传时用 [CrashKitLogSession.Default]。
  *
- * 旧：`log_type=technical_log` + `subtype=diagnostic` + `behavior=client_crash`
- * 新：`log_type=technical_log` + `subtype=crashkit` + `behavior=crashkit_crash|crashkit_anr`
- * data 额外带 `sdk=crashkit`、`sdk_ver`、`crash_type`、`crash_id`。
+ * data 带 `sdk`、`sdk_ver`、`crash_type`、`crash_id`。
  */
-object WigoLogEvent {
-    const val LOG_TYPE = "technical_log"
-    const val SUBTYPE = "crashkit"
-    const val BEHAVIOR_CRASH = "crashkit_crash"
-    const val BEHAVIOR_ANR = "crashkit_anr"
+object CrashKitLogEvent {
     const val SDK = "crashkit"
     const val CLIENT_TYPE = "crashkit"
     const val P_VER = "1.3"
@@ -31,7 +26,7 @@ object WigoLogEvent {
     private const val MSG_MAX = 180
     private val secSeq = AtomicInteger(0)
 
-    fun requestBody(payload: CrashTelemetryPayload, record: CrashRecord, session: WigoLogSession): String {
+    fun requestBody(payload: CrashTelemetryPayload, record: CrashRecord, session: CrashKitLogSession): String {
         val event = logEvent(payload, record, session)
         return if (session.bodyAsListWrapper) {
             JSONObject().put("list", JSONArray().put(event)).toString()
@@ -40,21 +35,20 @@ object WigoLogEvent {
         }
     }
 
-    fun logEvent(payload: CrashTelemetryPayload, record: CrashRecord, session: WigoLogSession): JSONObject {
+    fun logEvent(payload: CrashTelemetryPayload, record: CrashRecord, session: CrashKitLogSession): JSONObject {
         val rt = CrashKitRuntime.get()
         val pkg = firstNonBlank(session.pkg, payload.process, rt?.packageName.orEmpty())
         val ver = firstNonBlank(session.ver, payload.appVersion, rt?.appVersion.orEmpty())
         val deviceId = firstNonBlank(session.deviceId, session.androidId, rt?.guid.orEmpty(), payload.uid)
         val lanId = firstNonBlank(session.lanId, rt?.guid.orEmpty(), payload.crashId)
         val secId = if (session.secId > 0) session.secId else secSeq.incrementAndGet()
-        val tm = System.currentTimeMillis()
-        val inBg = session.isInBg ?: !ActivityTracker.get().isForeground
+        val tm = if (payload.crashTimeMs > 0L) payload.crashTimeMs else System.currentTimeMillis()
+        val inBg = payload.isInBg ?: session.isInBg ?: !ActivityTracker.get().isForeground
         val anr = payload.type == CrashType.ANR_CRASH
         val msgs = extData(payload)
-        val heap = Runtime.getRuntime()
-        val usedMb = ((heap.totalMemory() - heap.freeMemory()) / (1024L * 1024L)).toString()
-        val allocMb = (heap.totalMemory() / (1024L * 1024L)).toString()
-        val maxMb = (heap.maxMemory() / (1024L * 1024L)).toString()
+        val memTotal = firstNonBlank(payload.memoryTotal, session.memoryTotal)
+        val memAlloc = firstNonBlank(payload.memoryAllocate, session.memoryAllocate)
+        val memUsage = firstNonBlank(payload.memoryUsage, session.memoryUsage)
 
         val crash = JSONObject()
             .put("sdk", SDK)
@@ -66,20 +60,36 @@ object WigoLogEvent {
             .put("stack_trace", stackTrace(payload, record))
             .put("user_level", session.userLevel)
             .put("user_live_level", session.userLiveLevel)
-            .put("memory_total", session.memoryTotal ?: maxMb)
-            .put("memory_allocate", session.memoryAllocate ?: allocMb)
-            .put("memory_usage", session.memoryUsage ?: usedMb)
-            .put("ext_data1", payload.exception)
+            .put("memory_total", memTotal)
+            .put("memory_allocate", memAlloc)
+            .put("memory_usage", memUsage)
+            .put("exception", payload.exception)
             .put("is_in_bg", inBg)
             .put("tm", tm)
         putNullable(crash, "vip_level", session.vipLevel)
         putNullable(crash, "svip_level", session.svipLevel)
+//        putExt(crash, msgs)
+        putNonBlank(crash, "heap_used", payload.heapUsedMb)
+        putNonBlank(crash, "heap_max", payload.heapMaxMb)
+        putNonBlank(crash, "heap_pct", payload.heapPct)
+        putNonBlank(crash, "pss_mb", payload.pssMb)
+        putNonBlank(crash, "pss_kb", payload.pssKb)
+        putNonBlank(crash, "native_heap_kb", payload.nativeHeapKb)
+        putNonBlank(crash, "vm_rss_kb", payload.vmRssKb)
+        putNonBlank(crash, "vm_size_kb", payload.vmSizeKb)
+        putNonBlank(crash, "fd", payload.fdCount)
+        putNonBlank(crash, "threads", payload.threadCount)
+        putNonBlank(crash, "activity", payload.activityHistory)
+        putNonBlank(crash, "thread_id", payload.threadId)
+        putNonBlank(crash, "proc", payload.processName)
+        putNonBlank(crash, "res", payload.resource)
+        putNonBlank(crash, "ext", payload.ext)
+        if (payload.truncated) {
+            crash.put("truncated", true)
+        }
 
         val envelope = JSONObject()
             .put("data", JSONArray().put(crash))
-            .put("log_type", LOG_TYPE)
-            .put("subtype", SUBTYPE)
-            .put("behavior", if (anr) BEHAVIOR_ANR else BEHAVIOR_CRASH)
             .put("android_id", firstNonBlank(session.androidId, deviceId))
             .put("device_id", deviceId)
             .put("pkg", pkg)
@@ -99,6 +109,9 @@ object WigoLogEvent {
             .put("bizver", SDK)
             .put("p_ver", P_VER)
             .put("tm", tm)
+        putNonBlank(envelope, "log_type", session.logType)
+        putNonBlank(envelope, "subtype", session.subtype)
+        putNonBlank(envelope, "behavior", if (anr) session.anrBehavior else session.crashBehavior)
         val uid = session.userId
         if (!uid.isNullOrEmpty()) {
             envelope.put("user_id", uid)
@@ -163,6 +176,35 @@ object WigoLogEvent {
     }
 
     private fun stackTrace(payload: CrashTelemetryPayload, record: CrashRecord): String {
+        val body = stackBody(payload, record)
+        val head = MemSnapshot.headerLine(
+            MemSnapshot.Snapshot(
+                crashTimeMs = payload.crashTimeMs,
+                totalMb = payload.memoryTotal,
+                javaUsedMb = payload.heapUsedMb,
+                javaAllocMb = payload.memoryAllocate,
+                javaMaxMb = payload.heapMaxMb,
+                heapPct = payload.heapPct,
+                pssMb = payload.pssMb,
+                pssKb = payload.pssKb,
+                nativeHeapKb = payload.nativeHeapKb,
+                vmRssKb = payload.vmRssKb,
+                vmSizeKb = payload.vmSizeKb,
+                fd = payload.fdCount,
+                threads = payload.threadCount,
+                inBg = payload.isInBg,
+            ),
+        )
+        val merged = when {
+            head.isEmpty() -> body
+            body.isEmpty() -> head
+            body.startsWith("mem:") -> body
+            else -> "$head\n$body"
+        }
+        return if (merged.length <= STACK_MAX) merged else merged.substring(0, STACK_MAX)
+    }
+
+    private fun stackBody(payload: CrashTelemetryPayload, record: CrashRecord): String {
         if (payload.type != CrashType.JAVA_OOM) {
             for (f in record.dumpFiles) {
                 val text = readBounded(f, STACK_MAX)
@@ -181,7 +223,7 @@ object WigoLogEvent {
             }
             sb.append(payload.stack)
         }
-        return if (sb.length <= STACK_MAX) sb.toString() else sb.substring(0, STACK_MAX)
+        return sb.toString()
     }
 
     private fun causeOf(stack: String): Pair<String, String?>? {
@@ -233,6 +275,21 @@ object WigoLogEvent {
         }
     }
 
+    private fun putExt(json: JSONObject, msgs: Array<String?>) {
+        for (i in msgs.indices) {
+            val value = msgs[i]
+            if (!value.isNullOrEmpty()) {
+                json.put("ext_data${i + 1}", value)
+            }
+        }
+    }
+
+    private fun putNonBlank(json: JSONObject, key: String, value: String?) {
+        if (!value.isNullOrEmpty()) {
+            json.put(key, value)
+        }
+    }
+
     private fun putNullable(json: JSONObject, key: String, value: Int?) {
         if (value != null) {
             json.put(key, value)
@@ -252,6 +309,6 @@ object WigoLogEvent {
         if (text.length <= max) {
             return text
         }
-        return text.substring(0, max)
+        return text.take(max)
     }
 }

@@ -2,6 +2,7 @@
 
 Android 崩溃 / ANR / OOM **采集** SDK（Kotlin + `libcrashkit.so`）。
 
+- 仓库：https://github.com/hansweidong/crashkit-android.git
 - 包名：`com.yj.crashkit`
 - 版本：`1.4.5-SNAPSHOT`（调试覆盖同一坐标；正式发版关掉 `crashkit.snapshot`）
 - `libcrashkit.so` 按 **16KB** 页对齐（`arm64-v8a` / `armeabi-v7a`）
@@ -9,6 +10,34 @@ Android 崩溃 / ANR / OOM **采集** SDK（Kotlin + `libcrashkit.so`）。
 - **不含 HTTP 上报**。埋点宿主实现 `CrashTelemetrySink`；自建文件通道实现 `CrashReporter`
 
 能力按包体拆成两档：**线上只走 `CrashKit`**；测试包额外 `CrashKitLab.enable()`。
+
+---
+
+## 代码架构
+
+单模块 `crash-core`（Kotlin + `libcrashkit.so`）。公开面只有 `CrashKit` / `CrashKitConfig` / `CrashKitLab` 和 `log` 包的会话类型。
+
+```
+CrashKit 公开 API
+    → 采集适配（JavaCrashHandler / NativeCrashBridge / AnrDetector / ExitInfoAnrCollector）
+        → CrashPipeline（落盘 + pending）
+            → TelemetryCrashReporter（只在 META 回调一次）
+                → CrashKitLogCrashSink 组 JSON
+                    → 宿主 CrashKitLogTransport.send（即 LogModel.submitCrashKitJson）
+```
+
+| 层 | 包 / 文件 | 职责 |
+|---|---|---|
+| 公开入口 | `CrashKit.kt` / `CrashKitConfig.kt` | `init`、`setCrashKitLogUpload`、`setTelemetrySink`、`setReporter`、`setCrashCallback`、`uploadCustomCrash` |
+| 采集适配 | `JavaCrashHandler` / `NativeCrashBridge` + `crashkit_native.cpp` / `AnrDetector` / `ExitInfoAnrCollector` | 装 UEH（会 rewrap）、信号 handler 只做 async-signal-safe、SIGQUIT 旁路、冷启动 ExitInfo |
+| 运行时 | `internal/CrashKitRuntime.kt` | dumpDir、进程名、reporter 延迟就绪、uid / ext / userLogList |
+| 统一管线 | `internal/CrashPipeline.kt` | preCallback → 落盘 → crashCallback → pending.json → META → DUMP/LOGS → afterCallback → Blocker |
+| 现场数据 | `DumpWriter` / `OomLite` / `MetaJson` / `MemSnapshot` / `CrashLogcat` / `PendingStore` | 栈与 meta 落盘；内存按崩溃现场写入；pending 成败由 reporter 回调决定 |
+| 上报 SPI | `reporter/TelemetryCrashReporter.kt` | 只在 META 回调一次 sink；DUMP/LOGS 立刻成功。`AckSink` 返回 `false` 则保留 pending |
+| CrashKit JSON | `log/CrashKitLogCrashSink.kt` + `CrashKitLogEvent.kt` + `CrashKitLogSession.kt` | 组采集 JSON；`log_type` / `subtype` / `behavior` 可由宿主覆盖，未传用 `CrashKitLogSession.Default`；`send(body)` 交给宿主 |
+| 诊断隔离 | `CrashKitLab.kt` / `JavaOomMonitor` / `ResourceMonitor` / `MainThreadSampler` | 正式包默认关 |
+
+宿主会调的 API 见下文「线上可开的开关」和「按 CrashKit LogModel 上报」。
 
 ---
 
@@ -133,45 +162,62 @@ implementation "com.yj.crashkit:crash-core:1.4.5-SNAPSHOT"
 
 ### 宿主如何拿到采集结果
 
-SDK 只采集和落盘。上报有三条路，选一条（或 sink + Wigo 上传同时开）：
+SDK 只采集和落盘。上报有三条路，选一条（或 sink + CrashKit 上传同时开）：
 
-| | 埋点扩展字段 | Wigo 日志协议 | 自建 HTTP / 文件通道 |
+| | 埋点扩展字段 | CrashKit 日志协议 | 自建 HTTP / 文件通道 |
 |---|---|---|---|
-| 注册 | `setTelemetrySink { ... }` | `setWigoLogUpload(url) { WigoLogSession(...) }` | `setReporter { ... }` |
+| 注册 | `setTelemetrySink { ... }` | `setCrashKitLogUpload({ body -> hostSend(body) }) { CrashKitLogSession(...) }` | `setReporter { ... }` |
 | 数据 | `CrashTelemetryPayload.wireText` | 对齐 `LogModel.submitCrash` 的 V3 JSON | `CrashRecord` |
-| 地址 | 宿主自己的埋点 SDK | **宿主传入**，CrashKit 不明文写死域名、不做加密 | 宿主自己发 |
+| 地址 | 宿主自己的埋点 SDK | **宿主网络栈发送**，CrashKit 不开连接 | 宿主自己发 |
 
-### 按 Wigo LogModel 上报崩溃 / ANR
+### 按 CrashKit LogModel 上报崩溃 / ANR
 
-JSON 与 `SubTypeEvent.Crash` + `LogEventArgs` 一致：
+信封分类字段（`log_type` / `subtype` / `behavior`）可由宿主覆盖；未传时用 `CrashKitLogSession.Default`：
 
-- 旧 UEH：`subtype=diagnostic`，`behavior=client_crash`，`client_type=common`
-- CrashKit：`subtype=crashkit`，崩溃 `behavior=crashkit_crash`，ANR `behavior=crashkit_anr`，`client_type=crashkit`
-- data 多 `sdk=crashkit`、`sdk_ver`、`crash_id`、`crash_type`（JAVA_CRASH / ANR_CRASH / …）
+- data 带 `sdk`、`sdk_ver`、`crash_id`、`crash_type`（JAVA_CRASH / ANR_CRASH / …）
 - data：`stack_trace`、`ext_data1-5`（类名 / message / cause / 首帧）、内存、`lan_id` / `sec_id`
 
-`userId`、设备 id、`lanId` 每次上报时由宿主 lambda 现取。HTTP 失败返回 `false`，pending 下次启动重投。
+`userId`、设备 id、`lanId` 每次上报时由宿主 lambda 现取。宿主 [CrashKitLogTransport] 返回 `false` 时 pending 下次启动重投。
 
-明文接口请用 `/log/live-chat` 并把 `bodyAsListWrapper = false`（POST 数组）。走 `submitLogV3` 那条加密网关时，不要把加密 URL 直接塞进来——CrashKit 只发明文 JSON。
+CrashKit **不发起 HTTP**。明文 `/log/live-chat` 用 `bodyAsListWrapper = false`；走宿主 `submitLogV3` 加密网关时用 `bodyAsListWrapper = true`。
+
+**CrashKit 现行两拍接入**（init 时 Koin / LogModel 还没起来，不能并成一次 `init`）：
+
+| 步 | 工程文件 | 动作 |
+|---|---|---|
+| 0 | crashkit-android | `./gradlew publishToLocalMaven`（JDK 17），产物 `1.4.5-SNAPSHOT` |
+| 1 | `settings.gradle.kts` | `dependencyResolutionManagement` 含 `mavenLocal()` |
+| 2 | `appbase/build.gradle.kts` | `implementation("com.yj.crashkit:crash-core:1.4.5-SNAPSHOT")` |
+| 3 | `IApplication.onCreate`（主线程） | `CrashKit.init { setAppId("your-app-id") }`，此时 reporter 是 NoOp，只落盘 |
+| 4 | `CrashKitLogUpload.kt` | `setCrashKitLogUpload({ body -> logModel.submitCrashKitJson(body) }) { CrashKitLogSession(..., bodyAsListWrapper = true) }` |
+| 5 | `AppInitBizTask.AfterLaunch` | `CrashKitLogUpload.install()`，随后 ExitInfo 补报 + pending 重投 |
+| 6 | `LogModel.submitCrashKitJson` | `runBlocking` + `logService.submitLogV3`；走完 `tryGetData` 才返回 `true` |
 
 ```kotlin
-CrashKit.init(context) {
-    setAppId("wigoLive-and")
-    setWigoLogUpload("https://log.example.com/log/live-chat") {
-        WigoLogSession(
-            pkg = effectivePkg,
-            ver = versionName,
-            deviceId = deviceId,
-            userId = userId,
-            lanId = lanId,
-            secId = secId,
-            bodyAsListWrapper = false,
-        )
-    }
+// IApplication.onCreate（主线程）
+CrashKit.init(this) {
+    setAppId("your-app-id")
 }
-```
 
-init 之后仍可 `CrashKit.setWigoLogUpload(url) { ... }`（Koin / 登录态起来再装）。
+// AppInitBizTask.AfterLaunch：Koin / 登录态起来后再装
+CrashKit.setCrashKitLogUpload({ body -> logModel.submitCrashKitJson(body) }) {
+    CrashKitLogSession(
+        pkg = effectivePkg,
+        ver = versionName,
+        deviceId = deviceId,
+        userId = userId,
+        lanId = lanId,
+        secId = secId,
+        logType = hostLogType,
+        subtype = hostSubtype,
+        crashBehavior = hostCrashBehavior,
+        anrBehavior = hostAnrBehavior,
+        bodyAsListWrapper = true,
+    )
+}
+// 不覆盖分类字段时直接用本地默认：
+// CrashKit.setCrashKitLogUpload({ body -> logModel.submitCrashKitJson(body) }) { CrashKitLogSession.Default }
+```
 
 ---
 
@@ -231,7 +277,7 @@ if (BuildConfig.DEBUG) {
 
 ## 明确不做
 
-- 内置域名、密钥或加密网关（Wigo 上传只发明文 JSON，地址由宿主设置）
+- 内置域名、密钥或加密网关（CrashKit 上传只发明文 JSON，地址由宿主设置）
 - hprof 采集（含 KOOM 的 `suspend/fork/resume` 子进程 dump）与堆引用链分析
 - 快手 KOOM / xhook / 运行时 PLT hook
 - 拦截业务 `try/catch` 已消化的异常

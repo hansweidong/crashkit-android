@@ -29,9 +29,16 @@ object MetaJson {
             json.put("report_id", crashId)
             json.put("sdk_ver", CrashKit.VERSION)
             json.put("launch_time", formatBeijing(rt.launchTimeMs))
-            json.put("crash_time", formatBeijing(System.currentTimeMillis()))
-            json.put("local_time", formatLocal(System.currentTimeMillis()))
+            val now = System.currentTimeMillis()
+            val inBg = !ActivityTracker.get().isForeground
+            val mem = MemSnapshot.capture(type == CrashType.JAVA_OOM, now, inBg)
+            json.put("crash_time", formatBeijing(now))
+            json.put("crash_time_ms", mem.crashTimeMs.toString())
+            json.put("launch_time_ms", rt.launchTimeMs.toString())
+            json.put("local_time", formatLocal(now))
             json.put("crash_type", type.wireName())
+            json.put("is_in_bg", if (inBg) "1" else "0")
+            putMem(json, mem)
             json.put("pkg", rt.packageName)
             json.put("app_ver", rt.appVersion)
             json.put("app_id", rt.appId)
@@ -54,6 +61,27 @@ object MetaJson {
         } catch (_: Throwable) {
         }
         return json.toString()
+    }
+
+    private fun putMem(json: JSONObject, mem: MemSnapshot.Snapshot) {
+        putNonBlank(json, "mem_total_mb", mem.totalMb)
+        putNonBlank(json, "mem_java_used_mb", mem.javaUsedMb)
+        putNonBlank(json, "mem_java_alloc_mb", mem.javaAllocMb)
+        putNonBlank(json, "mem_java_max_mb", mem.javaMaxMb)
+        putNonBlank(json, "heap_pct", mem.heapPct)
+        putNonBlank(json, "mem_pss_mb", mem.pssMb)
+        putNonBlank(json, "mem_pss_kb", mem.pssKb)
+        putNonBlank(json, "mem_native_kb", mem.nativeHeapKb)
+        putNonBlank(json, "vm_rss_kb", mem.vmRssKb)
+        putNonBlank(json, "vm_size_kb", mem.vmSizeKb)
+        putNonBlank(json, "fd_count", mem.fd)
+        putNonBlank(json, "thread_count", mem.threads)
+    }
+
+    private fun putNonBlank(json: JSONObject, key: String, value: String) {
+        if (value.isNotEmpty()) {
+            json.put(key, value)
+        }
     }
 
     private fun extJson(ext: Map<String, String>): JSONObject {
