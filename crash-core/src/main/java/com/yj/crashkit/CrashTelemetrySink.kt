@@ -14,11 +14,11 @@ fun interface CrashTelemetrySink {
 }
 
 /**
- * 带投递结果的 [CrashTelemetrySink]。**需要「没送到就下次启动重投」的宿主必须实现这个。**
+ * 带投递结果的 [CrashTelemetrySink]。**需要「没送到就再投」的宿主必须实现这个。**
  *
  * 只实现 [CrashTelemetrySink] 时 [onTelemetry] 没有返回值，SDK 无从判断埋点是否真的收下，
  * 只能一律按成功处理并删掉 `pending/{id}.json` —— 重投兜底等于不存在。实现本接口后返回
- * `false` 即保留记录，下次冷启动 reporter 就位时自动重投。
+ * `false` 即保留记录，等宿主调用 [CrashKit.retryPending]。
  *
  * 返回 `true` 的含义是「**已确认送达或已落到你自己的持久化队列**」，不是「已入队内存」。
  * 在内存入队时就返回 `true`，进程随后被杀同样会丢，而且 pending 已经被删掉了。

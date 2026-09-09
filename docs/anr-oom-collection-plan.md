@@ -1,7 +1,10 @@
 # CrashKit 采集方案梳理（对齐 Matrix + KOOM）
 
 > 状态：**已全部落地于 `1.4.0`**，`1.4.1` 修补历史补报的两处缺陷（第 6 节），
-> `1.4.2` 修掉真机实测暴露出的四个采集缺陷（第 7 节），`1.4.5` 修掉确认空转被杀丢现场（第 8 节）。评审基线为 `1.3.7`。
+> `1.4.2` 修掉真机实测暴露出的四个采集缺陷（第 7 节），`1.4.5` 修掉确认空转被杀丢现场（第 8 节）。
+> 现行（`1.4.5-SNAPSHOT` 工作区）：pending **不再**随 `init` 自动重投，改由宿主 `CrashKit.retryPending()`；
+> `init` 必须在主线程且每进程只成功一次；Activity 历史上报为 `Page(C:S:R)`（第 9 节）。
+> 评审基线为 `1.3.7`。
 > 决策已定项：hprof 采集在线上与 Lab **全部下线**，OOM 只保留计数快照，不实现 fork dump。
 >
 > 下面第 2 节保留评审时的问题清单（诊断依据），第 5 节记录实际落地方式与两处偏离。
@@ -440,3 +443,11 @@ debug 页会在 AMS 5s 超时之前就自己发 SIGQUIT。`1.4.4` 只认「队�
 
 修复：主线程第一帧不是 `MessageQueue` / `Looper.loop` 空转就立刻上报；AM 轮询每一轮重新抓栈。
 空闲主线程经常是 `WAITING`（卡在 `nativePollOnce`），不能拿 `Thread.state` 当 ANR。
+
+## 9. `1.4.5` 之后：重投时机、init 约束、Activity 历史
+
+第 7.4 节当时的修法是 `init` 里 `whenReporterReady { resendPendingAsync }`。现行代码已经改掉：
+
+- **pending 重投**：`CrashKit.retryPending()`，由宿主在鉴权 / 网络就绪后调用，可多次。正在重投时后来的调用跳过。没有真实 reporter 不清 pending。`init` 不再自动重投。ExitInfo 补报仍等 reporter 到位再跑。
+- **`init`**：必须主线程、每进程只成功一次。非主线程或重复调用返回 `false`，**不会** post 到主线程补做（晚一个 loop 可能旁路不到 SIGQUIT）。
+- **Activity history**：`ActivityHistoryFormat` 把相邻同页生命周期收成 `DebugActivity(C:S:R)`。内部仍是早→晚；上报 `fromTop` 从栈顶往回写，埋点最多 6 页 / 192 字，超长丢栈底、不截断当前页类名。日志 JSON 字段是 `activity`。`ext_data1–5` 仍不写出。

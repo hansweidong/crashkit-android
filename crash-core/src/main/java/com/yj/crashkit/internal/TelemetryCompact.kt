@@ -5,6 +5,7 @@ import com.yj.crashkit.CrashRecord
 import com.yj.crashkit.CrashTelemetryPayload
 import com.yj.crashkit.CrashType
 import com.yj.crashkit.anr.AnrJavaDump
+import com.yj.crashkit.history.ActivityHistoryFormat
 import org.json.JSONObject
 import java.io.File
 import java.nio.charset.Charset
@@ -21,7 +22,9 @@ internal object TelemetryCompact {
     private const val EXCEPTION_MAX = 180
     /** ANR 的 `e` 要能放下主线程头 + 前几帧 + `... Nfw`，180 会把现场截成一句 ANR。 */
     private const val ANR_EXCEPTION_MAX = 1200
-    private const val HISTORY_MAX = 96
+    /** 按整页计长；超了丢栈底，不截断栈顶类名。6 个常见 Activity 名大约 160 字。 */
+    private const val HISTORY_MAX = 192
+    private const val RECENT_PAGES = 6
     private const val EXT_MAX = 280
     private const val RES_MAX = 220
     private const val HEADER_RESERVE = 860
@@ -34,7 +37,11 @@ internal object TelemetryCompact {
         val dump = stackRaw(record)
         val res = clip(resourceSnippet(record), RES_MAX)
         val exception = exceptionOf(record, meta, dump)
-        val history = clip(recentHistory(meta["history"].orEmpty()), HISTORY_MAX)
+        val history = ActivityHistoryFormat.fromTop(
+            meta["history"].orEmpty(),
+            maxPages = RECENT_PAGES,
+            maxChars = HISTORY_MAX,
+        )
         val ext = clip(compactExt(meta["ext"].orEmpty()), EXT_MAX)
 
         var stackBudget = (cap - HEADER_RESERVE - exception.length - history.length - ext.length - res.length)
@@ -609,17 +616,6 @@ internal object TelemetryCompact {
             return clip(raw, EXT_MAX)
         }
         return parts.joinToString(";")
-    }
-
-    private fun recentHistory(raw: String): String {
-        if (raw.isEmpty()) {
-            return ""
-        }
-        val parts = raw.split(" -> ")
-        if (parts.size <= 4) {
-            return raw
-        }
-        return parts.takeLast(4).joinToString(">")
     }
 
     private fun isFrame(line: String): Boolean {

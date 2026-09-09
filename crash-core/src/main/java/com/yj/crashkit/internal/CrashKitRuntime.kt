@@ -105,8 +105,7 @@ class CrashKitRuntime private constructor(app: Context, config: CrashKitConfig) 
      * 挂起到宿主真正注册 reporter / telemetrySink 之后再跑。可注册多个。
      *
      * 宿主常在 [CrashKit.init] 之后才调 `setTelemetrySink`，此时 reporter 还是
-     * [NoOpCrashReporter]。历史 ANR 补报、pending 重投要是在那之前就走完管线，
-     * 数据会静默丢掉。
+     * [NoOpCrashReporter]。历史 ANR 补报要是在那之前就走完管线，数据会静默丢掉。
      */
     fun whenReporterReady(action: () -> Unit) {
         synchronized(readyLock) {

@@ -4,11 +4,11 @@ import android.app.Activity
 import android.app.Application
 import android.os.Bundle
 import com.yj.crashkit.internal.JavaCrashHandler
-import java.util.ArrayDeque
+import java.util.ArrayList
 
 /** 记录前后台 Activity，写入崩溃 JSON 的 history 字段。 */
 class ActivityTracker private constructor() : Application.ActivityLifecycleCallbacks {
-    private val history = ArrayDeque<String>()
+    private val spans = ArrayList<ActivityHistoryFormat.Span>()
     private var started = 0
     @Volatile var isForeground: Boolean = false
         private set
@@ -19,38 +19,31 @@ class ActivityTracker private constructor() : Application.ActivityLifecycleCallb
 
     @Synchronized
     fun getHistory(): String {
-        val sb = StringBuilder()
-        for (s in history) {
-            if (sb.isNotEmpty()) {
-                sb.append(" -> ")
-            }
-            sb.append(s)
-        }
-        return sb.toString()
+        return ActivityHistoryFormat.render(spans)
     }
 
     @Synchronized
-    private fun push(event: String) {
-        history.addLast(event)
-        while (history.size > MAX) {
-            history.removeFirst()
+    private fun push(activity: Activity, letter: Char) {
+        ActivityHistoryFormat.absorb(spans, activity.javaClass.simpleName, letter)
+        while (spans.size > MAX_PAGES) {
+            spans.removeAt(0)
         }
     }
 
     override fun onActivityCreated(activity: Activity, savedInstanceState: Bundle?) {
         JavaCrashHandler.ensureOuter()
-        push("C:" + activity.javaClass.simpleName)
+        push(activity, 'C')
     }
 
     override fun onActivityStarted(activity: Activity) {
         JavaCrashHandler.ensureOuter()
         started++
         isForeground = started > 0
-        push("S:" + activity.javaClass.simpleName)
+        push(activity, 'S')
     }
 
     override fun onActivityResumed(activity: Activity) {
-        push("R:" + activity.javaClass.simpleName)
+        push(activity, 'R')
     }
 
     override fun onActivityPaused(activity: Activity) = Unit
@@ -63,11 +56,11 @@ class ActivityTracker private constructor() : Application.ActivityLifecycleCallb
     override fun onActivitySaveInstanceState(activity: Activity, outState: Bundle) = Unit
 
     override fun onActivityDestroyed(activity: Activity) {
-        push("D:" + activity.javaClass.simpleName)
+        push(activity, 'D')
     }
 
     companion object {
-        private const val MAX = 20
+        private const val MAX_PAGES = 20
         private val INSTANCE = ActivityTracker()
 
         @JvmStatic

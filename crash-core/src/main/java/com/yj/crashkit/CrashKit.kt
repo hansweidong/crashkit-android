@@ -50,12 +50,25 @@ object CrashKit {
         return init(builder?.build())
     }
 
+    /**
+     * 必须在**主线程**调用，每个进程只成功一次。
+     *
+     * SIGQUIT 旁路要在主线程 UNBLOCK；非主线程直接返回 `false`，不会 post 到主线程补做
+     * （晚一个 loop 可能旁路不到）。重复调用同样返回 `false`。
+     *
+     * 宿主常在 init 之后才 [setCrashKitLogUpload]。ExitInfo 补报等真实 reporter 到位再跑，
+     * 避免 NoOp 把数据吃掉。pending 重投不在这里自动跑，由宿主在具备鉴权后调 [retryPending]。
+     */
     @JvmStatic
     fun init(config: CrashKitConfig?): Boolean {
         val ctx = config?.context ?: return false
         synchronized(lock) {
             if (inited) {
                 KitLog.i(TAG, "already init")
+                return false
+            }
+            if (!isMainThread()) {
+                KitLog.e(TAG, "init skipped: must run on main thread once")
                 return false
             }
             val app = ctx.applicationContext
@@ -73,10 +86,7 @@ object CrashKit {
             val nativeOk = NativeCrashBridge.install(runtime.dumpDir.absolutePath, p)
             runtime.setCatchNative(nativeOk)
             startAnrDetectorLocked(app)
-            // 宿主常在 init 之后才 setTelemetrySink。这两件事都要等真正的 reporter 到位再跑，
-            // 否则数据会被 NoOpCrashReporter 吃掉，而游标 / pending 已经被清了。
             runtime.whenReporterReady { ExitInfoAnrCollector.start(app, p) }
-            runtime.whenReporterReady { resendPendingAsync(p) }
             KitLog.i(
                 TAG,
                 "init version=$VERSION native=$nativeOk process=${runtime.processName} dumpDir=${runtime.dumpDir}",
@@ -221,6 +231,19 @@ object CrashKit {
     }
 
     /**
+     * 重投盘上未送达的 pending。可多次调用。
+     *
+     * 正在重投时后来的调用会被跳过。没有真实 reporter 时不会清 pending。
+     * 在后台线程跑，不占用调用方线程。
+     * 何时调用由宿主决定（CrashKit 不感知登录 / token / 密钥）。
+     */
+    @JvmStatic
+    fun retryPending() {
+        val p = pipeline ?: return
+        resendPendingAsync(p)
+    }
+
+    /**
      * 可选：周期性采主线程栈，供 ANR 上报附带历史样本。
      *
      * ANR 采集已在 [init] 启动（SIGQUIT 旁路 + MessageQueue/AM 确认，再把信号交回系统）。
@@ -265,7 +288,7 @@ object CrashKit {
         KitLog.i(TAG, "ANR detecting started")
     }
 
-    /** 重投要读盘、要走 reporter，别占着 init 所在的主线程。 */
+    /** 重投要读盘、要走 reporter，别占着调用方线程。 */
     private fun resendPendingAsync(p: CrashPipeline) {
         val t = Thread({
             try {
@@ -276,6 +299,14 @@ object CrashKit {
         }, "CrashKit-Resend")
         t.isDaemon = true
         t.start()
+    }
+
+    private fun isMainThread(): Boolean {
+        return try {
+            Looper.getMainLooper().thread === Thread.currentThread()
+        } catch (_: Throwable) {
+            false
+        }
     }
 
     /**

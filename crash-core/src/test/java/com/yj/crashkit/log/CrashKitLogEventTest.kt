@@ -170,7 +170,7 @@ class CrashKitLogEventTest {
             assertEquals("420000", crash.getString("vm_rss_kb"))
             assertEquals("120", crash.getString("fd"))
             assertEquals("64", crash.getString("threads"))
-            assertEquals("C:Main -> R:Main", crash.getString("activity"))
+            assertEquals("Main(C:R)", crash.getString("activity"))
             assertEquals("com.example.app:push", crash.getString("proc"))
             assertEquals("9", crash.getString("thread_id"))
             assertEquals(1700000000123L, crash.getLong("tm"))

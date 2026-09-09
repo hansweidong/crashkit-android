@@ -27,11 +27,36 @@ class CrashTelemetryUnitTest {
             assertTrue(payload.wireText.length <= CrashTelemetry.MAX_CHARS)
             assertEquals(CrashType.JAVA_CRASH, payload.type)
             assertEquals("id-1", payload.crashId)
+            assertEquals("Main(C:R)-Splash(C:S:R)", payload.activityHistory)
             assertTrue(payload.exception.contains("NullPointerException"))
             assertTrue(payload.stack.contains("com.example.app.Foo.bar") || payload.wireText.contains("Foo.bar"))
             val text = payload.wireText
             assertTrue(text.contains("JAVA_CRASH"))
             assertTrue(text.contains("id-1"))
+        } finally {
+            dump.delete()
+        }
+    }
+
+    @Test
+    fun activityHistoryStartsAtStackTopWithoutEllipsis() {
+        val dump = tempFile("npe.dmp", "java.lang.NullPointerException\n\tat com.example.A.a(A.java:1)\n")
+        try {
+            val history =
+                "SplashActivity(C:S:R)-MainActivity(C:S:R)-SplashActivity(D)-SettingActivity(C:S:R)-DebugActivity(C:S:R)"
+            val record = CrashRecord(
+                "id-top",
+                CrashType.JAVA_CRASH,
+                """{"exception":"java.lang.NullPointerException","history":"$history"}""",
+                listOf(dump),
+                emptyList(),
+            )
+            val payload = CrashTelemetry.of(record)
+            assertEquals(
+                "DebugActivity(C:S:R)-SettingActivity(C:S:R)-SplashActivity(D)-MainActivity(C:S:R)-SplashActivity(C:S:R)",
+                payload.activityHistory,
+            )
+            assertFalse(payload.activityHistory.contains("…"))
         } finally {
             dump.delete()
         }

@@ -62,6 +62,8 @@ class CrashKitKotlinTest {
         assertTrue(methods.contains("openSignalReport"))
         assertTrue(methods.contains("addExtraInfo"))
         assertTrue(methods.contains("setAppVersion"))
+        assertTrue(methods.contains("retryPending"))
+        CrashKit.retryPending()
         val initBuilder = CrashKit::class.java.getMethod(
             "init",
             CrashKitConfig.Builder::class.java,

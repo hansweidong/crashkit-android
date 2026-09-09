@@ -23,7 +23,7 @@ class CrashPipeline(private val runtime: CrashKitRuntime) {
     private val once = AtomicBoolean(false)
     private val anrOnce = AtomicBoolean(false)
     private val exitInfoOnce = AtomicBoolean(false)
-    private val resendOnce = AtomicBoolean(false)
+    private val resendBusy = AtomicBoolean(false)
 
     fun handleJava(@Suppress("UNUSED_PARAMETER") thread: Thread?, throwable: Throwable?) {
         if (!runtime.gate.isEnabled()) {
@@ -242,7 +242,7 @@ class CrashPipeline(private val runtime: CrashKitRuntime) {
 
     /**
      * 三阶段投递。**三段全成功才删 pending 记录**；只要有一段失败、或者 reporter 压根
-     * 没回调，记录就留在盘上，下次启动由 [resendPending] 重投。
+     * 没回调，记录就留在盘上，等宿主 [com.yj.crashkit.CrashKit.retryPending] 再投。
      *
      * `1.4.1` 之前 [PendingStore] 只有写没有删也没有重投，`pending/` 是个只写不读的坟场
      * （设备实测积了 11 条），成功的删不掉、失败的也补不回来。
@@ -287,8 +287,7 @@ class CrashPipeline(private val runtime: CrashKitRuntime) {
     }
 
     /**
-     * 把上次进程没投递成功的记录重投一遍。由 `CrashKit.init` 在宿主装好真实 reporter
-     * 之后在后台线程触发。
+     * 把没投递成功的记录再投一遍。宿主在具备鉴权后多次调用（例如登录后）。
      *
      * 只走 reporter / telemetrySink：宿主 [CrashCallback] 三钩子的语义是「此刻正在崩溃」，
      * 冷启动阶段重放会干扰启动流程。也不碰 [blocker]——那是崩溃现场用来给上报争取时间的，
@@ -298,16 +297,25 @@ class CrashPipeline(private val runtime: CrashKitRuntime) {
         if (!runtime.gate.isEnabled()) {
             return
         }
-        if (!resendOnce.compareAndSet(false, true)) {
+        if (!runtime.hasRealReporter()) {
+            KitLog.i(TAG, "resend pending skipped, no reporter")
             return
         }
-        val records = PendingStore.loadAll(runtime.dumpDir)
-        if (records.isEmpty()) {
+        if (!resendBusy.compareAndSet(false, true)) {
+            KitLog.i(TAG, "resend pending busy, skip")
             return
         }
-        KitLog.i(TAG, "resend pending count=${records.size}")
-        for (r in records) {
-            emitAll(r, unblock = false)
+        try {
+            val records = PendingStore.loadAll(runtime.dumpDir)
+            if (records.isEmpty()) {
+                return
+            }
+            KitLog.i(TAG, "resend pending count=${records.size}")
+            for (r in records) {
+                emitAll(r, unblock = false)
+            }
+        } finally {
+            resendBusy.set(false)
         }
     }
 

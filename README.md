@@ -30,11 +30,11 @@ CrashKit 公开 API
 
 | 层 | 包 / 文件 | 职责 |
 |---|---|---|
-| 公开入口 | `CrashKit.kt` / `CrashKitConfig.kt` | `init`、`setCrashKitLogUpload`、`setTelemetrySink`、`setReporter`、`setCrashCallback`、`uploadCustomCrash` |
+| 公开入口 | `CrashKit.kt` / `CrashKitConfig.kt` | `init`、`setCrashKitLogUpload`、`setTelemetrySink`、`setReporter`、`setCrashCallback`、`retryPending`、`uploadCustomCrash` |
 | 采集适配 | `JavaCrashHandler` / `NativeCrashBridge` + `crashkit_native.cpp` / `AnrDetector` / `ExitInfoAnrCollector` | 装 UEH（会 rewrap）、信号 handler 只做 async-signal-safe、SIGQUIT 旁路、冷启动 ExitInfo |
 | 运行时 | `internal/CrashKitRuntime.kt` | dumpDir、进程名、reporter 延迟就绪、uid / ext / userLogList |
 | 统一管线 | `internal/CrashPipeline.kt` | preCallback → 落盘 → crashCallback → pending.json → META → DUMP/LOGS → afterCallback → Blocker |
-| 现场数据 | `DumpWriter` / `OomLite` / `MetaJson` / `MemSnapshot` / `CrashLogcat` / `PendingStore` | 栈与 meta 落盘；内存按崩溃现场写入；pending 成败由 reporter 回调决定 |
+| 现场数据 | `DumpWriter` / `OomLite` / `MetaJson` / `MemSnapshot` / `CrashLogcat` / `PendingStore` / `ActivityHistoryFormat` | 栈与 meta 落盘；内存按崩溃现场写入；Activity 压成 `Page(C:S:R)`；pending 成败由 reporter 回调决定 |
 | 上报 SPI | `reporter/TelemetryCrashReporter.kt` | 只在 META 回调一次 sink；DUMP/LOGS 立刻成功。`AckSink` 返回 `false` 则保留 pending |
 | CrashKit JSON | `log/CrashKitLogCrashSink.kt` + `CrashKitLogEvent.kt` + `CrashKitLogSession.kt` | 组采集 JSON；`log_type` / `subtype` / `behavior` 可由宿主覆盖，未传用 `CrashKitLogSession.Default`；`send(body)` 交给宿主 |
 | 诊断隔离 | `CrashKitLab.kt` / `JavaOomMonitor` / `ResourceMonitor` / `MainThreadSampler` | 正式包默认关 |
@@ -74,7 +74,9 @@ hprof 采集**整体下线**，Lab 也拿不到：`Debug.dumpHprofData` 会 susp
 
 统一管线（顺序不可调）：`preCallback` → 落盘 → `crashCallback` → `pending/{id}.json` → META / DUMP / LOGS → `afterCallback` → Blocker。
 
-**三段全部上报成功才删 `pending/{id}.json`**；任一段失败、或 reporter 不回调，记录就留在盘上，下次启动等宿主装好 reporter 后自动重投（只走 reporter/sink，不触发 `CrashCallback` 三钩子）。
+**三段全部上报成功才删 `pending/{id}.json`**；任一段失败、或 reporter 不回调，记录就留在盘上。
+宿主在具备鉴权后调 `CrashKit.retryPending()` 再投（可多次）；只走 reporter/sink，不触发 `CrashCallback` 三钩子。
+`init` 不会自动重投。
 
 ### 怎样才算「一定送到后台」
 
@@ -83,7 +85,7 @@ hprof 采集**整体下线**，Lab 也拿不到：`Debug.dumpHprofData` 会 susp
 | 接法 | 能否重投 | 说明 |
 |---|---|---|
 | `setTelemetrySink(CrashTelemetrySink)` | **不能** | `onTelemetry` 没有返回值，SDK 只能一律记成功并删掉 pending |
-| `setTelemetrySink(CrashTelemetryAckSink)` | 能 | 返回 `false` 即保留记录，下次冷启动自动重投 |
+| `setTelemetrySink(CrashTelemetryAckSink)` | 能 | 返回 `false` 即保留记录，等宿主 `CrashKit.retryPending()` |
 | `setReporter(CrashReporter)` | 能 | 上报失败时 `callback.onResult(false)` |
 
 `true` 的含义是「**已确认送达，或已落到你自己的持久化队列**」。在内存入队时就返回 `true`，
@@ -92,9 +94,9 @@ hprof 采集**整体下线**，Lab 也拿不到：`Debug.dumpHprofData` 会 susp
 ANR 的 `blockerWaitMs` 是 0（不等待）：ANR 不是 SDK 在杀进程，等待换不来任何安全边际。
 真正的兜底是 pending 重投。API 30+ 还有 `ApplicationExitInfo` 补报，**API 24–29 没有**。
 
-> `CrashKit.init` 请在**主线程**调用。ANR 旁路要在主线程解除 SIGQUIT 屏蔽，不在主线程时 SDK 会 post 回主线程，但会晚一个消息循环。
+> `CrashKit.init` **必须在主线程调用**，每个进程只成功一次。非主线程或重复调用返回 `false`，不会 post 到主线程补做。ANR 旁路要在主线程解除 SIGQUIT 屏蔽。
 
-附件：`.dmp` 文本栈、Java/Native 崩溃时 `logcat -t 500`（OOM/ANR 不采 logcat）、OOM 只写计数快照、可选 `/proc`（显式打开 FD/Mem/Thread 时；全线程栈仅 Lab）、userLogList、Activity history。
+附件：`.dmp` 文本栈、Java/Native 崩溃时 `logcat -t 500`（OOM/ANR 不采 logcat）、OOM 只写计数快照、可选 `/proc`（显式打开 FD/Mem/Thread 时；全线程栈仅 Lab）、userLogList、Activity history（`Main(C:R)-Splash(C:S:R)`，相邻同页生命周期收进括号；埋点从栈顶最多 6 页 / 192 字）。
 
 dump 目录按进程隔离：主进程用 `cacheDir/crash`，子进程用 `cacheDir/crash/{进程段}`（`com.foo.app:push` → `push`）。`native_crash.dmp` / `anr_error.log` / `main_stack.txt` 是固定名，不分目录的话多进程会互相覆盖，`pending/` 也会串。
 
@@ -110,6 +112,7 @@ dump 目录按进程隔离：主进程用 `cacheDir/crash`，子进程用 `cache
 | `setCrashCallback` / `setAnrListener` | 三钩子、ANR 通知 |
 | `setUid` / `setExtInfo` / `setUserLogList` | 写入 META |
 | `setReportEnabled(false)` | 只关上报，不卸 UEH |
+| `retryPending()` | 重投盘上 pending；登录 / token 就绪后由宿主调用，可多次 |
 
 ### 线上接入示例
 
@@ -187,46 +190,29 @@ SDK 只采集和落盘。上报有三条路，选一条（或 sink + CrashKit �
 - data 带 `sdk`、`sdk_ver`、`crash_id`、`crash_type`（JAVA_CRASH / ANR_CRASH / …）
 - data：`stack_trace`、`exception`、内存、`lan_id` / `sec_id`
 
-`userId`、设备 id、`lanId` 每次上报时由宿主 lambda 现取。宿主 [CrashKitLogTransport] 返回 `false` 时 pending 下次启动重投。
+`userId`、设备 id、`lanId` 每次上报时由宿主 lambda 现取。宿主 [CrashKitLogTransport] 返回 `false` 时 pending 留盘，等 `CrashKit.retryPending()`。
 
 CrashKit **不发起 HTTP**。明文 `/log/live-chat` 用 `bodyAsListWrapper = false`；走宿主 `submitLogV3` 加密网关时用 `bodyAsListWrapper = true`。
 
-**CrashKit 现行两拍接入**（init 时 Koin / LogModel 还没起来，不能并成一次 `init`）：
+**CrashKit 现行两拍接入**（SDK 不感知登录 / token / 加密 key；这些由宿主适配层判断）：
 
 | 步 | 工程文件 | 动作 |
 |---|---|---|
 | 0 | crashkit-android | 远程：打 tag 后走 [JitPack](https://jitpack.io/)；本地调试 `./gradlew publishToLocalMaven`（JDK 17） |
 | 1 | `settings.gradle.kts` | `dependencyResolutionManagement` 含 `maven { url = uri("https://jitpack.io") }`（调试可加 `mavenLocal()`） |
 | 2 | `appbase/build.gradle.kts` | `implementation("com.github.hansweidong:crashkit-android:v1.4.5")` |
-| 3 | `IApplication.onCreate`（主线程） | `CrashKit.init { setAppId("your-app-id") }`，此时 reporter 是 NoOp，只落盘 |
-| 4 | `CrashKitLogUpload.kt` | `setCrashKitLogUpload({ body -> logModel.submitCrashKitJson(body) }) { CrashKitLogSession(..., bodyAsListWrapper = true) }` |
-| 5 | `AppInitBizTask.AfterLaunch` | `CrashKitLogUpload.install()`，随后 ExitInfo 补报 + pending 重投 |
-| 6 | `LogModel.submitCrashKitJson` | `runBlocking` + `logService.submitLogV3`；走完 `tryGetData` 才返回 `true` |
+| 3 | `IApplication.onCreate`（主进程主线程） | `CrashKit.init { setAppId("your-app-id") }`，此时 reporter 是 NoOp，只落盘。非主线程 / 重复调用不会装 |
+| 4 | `CrashKitWigoUpload.install` | `AfterLaunch` 接线。宿主适配层在 token+key 就绪、以及网络恢复时自己调 `CrashKit.retryPending()` |
+| 5 | `LogModel.submitCrashKitJson` | 只发网：`runBlocking` + `submitLogV3`；走完 `tryGetData` 才返回 `true` |
 
 ```kotlin
-// IApplication.onCreate（主线程）
+// IApplication.onCreate（主进程、主线程）
 CrashKit.init(this) {
     setAppId("your-app-id")
 }
 
-// AppInitBizTask.AfterLaunch：Koin / 登录态起来后再装
-CrashKit.setCrashKitLogUpload({ body -> logModel.submitCrashKitJson(body) }) {
-    CrashKitLogSession(
-        pkg = effectivePkg,
-        ver = versionName,
-        deviceId = deviceId,
-        userId = userId,
-        lanId = lanId,
-        secId = secId,
-        logType = hostLogType,
-        subtype = hostSubtype,
-        crashBehavior = hostCrashBehavior,
-        anrBehavior = hostAnrBehavior,
-        bodyAsListWrapper = true,
-    )
-}
-// 不覆盖分类字段时直接用本地默认：
-// CrashKit.setCrashKitLogUpload({ body -> logModel.submitCrashKitJson(body) }) { CrashKitLogSession.Default }
+// AppInitBizTask.AfterLaunch：Koin 起来后只装宿主适配
+CrashKitWigoUpload.install()
 ```
 
 ---
