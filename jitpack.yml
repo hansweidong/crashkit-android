@@ -1,0 +1,16 @@
+jdk:
+  - openjdk17
+before_install:
+  - chmod +x gradlew
+# JitPack 公开请求会带 VERSION（tag / 分支 SNAPSHOT / commit）。
+# 拒绝分支 SNAPSHOT，避免任何人用 main-SNAPSHOT 在 JitPack 上编主分支。
+# 正式包只认 git tag。JitCI 走 .jitci.yml，不受这条限制。
+install:
+  - |
+    case "${VERSION:-}" in
+      *SNAPSHOT*|main|master)
+        echo "JitPack only builds git tags. Branch snapshots (e.g. main-SNAPSHOT) are disabled."
+        exit 1
+        ;;
+    esac
+    ./gradlew publishToMavenLocal -x test

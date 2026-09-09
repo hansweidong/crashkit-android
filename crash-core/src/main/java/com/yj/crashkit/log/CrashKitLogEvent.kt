@@ -23,7 +23,6 @@ object CrashKitLogEvent {
     const val CLIENT_TYPE = "crashkit"
     const val P_VER = "1.3"
     private const val STACK_MAX = 24 * 1024
-    private const val MSG_MAX = 180
     private val secSeq = AtomicInteger(0)
 
     fun requestBody(payload: CrashTelemetryPayload, record: CrashRecord, session: CrashKitLogSession): String {
@@ -45,7 +44,6 @@ object CrashKitLogEvent {
         val tm = if (payload.crashTimeMs > 0L) payload.crashTimeMs else System.currentTimeMillis()
         val inBg = payload.isInBg ?: session.isInBg ?: !ActivityTracker.get().isForeground
         val anr = payload.type == CrashType.ANR_CRASH
-        val msgs = extData(payload)
         val memTotal = firstNonBlank(payload.memoryTotal, session.memoryTotal)
         val memAlloc = firstNonBlank(payload.memoryAllocate, session.memoryAllocate)
         val memUsage = firstNonBlank(payload.memoryUsage, session.memoryUsage)
@@ -68,7 +66,6 @@ object CrashKitLogEvent {
             .put("tm", tm)
         putNullable(crash, "vip_level", session.vipLevel)
         putNullable(crash, "svip_level", session.svipLevel)
-//        putExt(crash, msgs)
         putNonBlank(crash, "heap_used", payload.heapUsedMb)
         putNonBlank(crash, "heap_max", payload.heapMaxMb)
         putNonBlank(crash, "heap_pct", payload.heapPct)
@@ -117,41 +114,6 @@ object CrashKitLogEvent {
             envelope.put("user_id", uid)
         }
         return envelope
-    }
-
-    internal fun extData(payload: CrashTelemetryPayload): Array<String?> {
-        val exception = payload.exception.trim()
-        if (payload.type == CrashType.ANR_CRASH) {
-            return arrayOf(
-                clip(payload.type.wireName(), MSG_MAX),
-                clip(exception.lineSequence().firstOrNull().orEmpty(), MSG_MAX),
-                clip(payload.resource, MSG_MAX).ifEmpty { null },
-                null,
-                firstAtFrame(exception) ?: firstAtFrame(payload.stack),
-            )
-        }
-        val (cls, msg) = splitClassAndMessage(exception)
-        val cause = causeOf(payload.stack)
-        return arrayOf(
-            clip(cls ?: payload.type.wireName(), MSG_MAX),
-            clip(msg.orEmpty(), MSG_MAX).ifEmpty { null },
-            cause?.first,
-            cause?.second,
-            firstAtFrame(payload.stack) ?: firstAtFrame(exception),
-        )
-    }
-
-    internal fun splitClassAndMessage(exception: String): Pair<String?, String?> {
-        val line = exception.lineSequence().firstOrNull()?.trim().orEmpty()
-        if (line.isEmpty() || line.startsWith("----- ")) {
-            return null to line.ifEmpty { null }
-        }
-        val idx = line.indexOf(": ")
-        return if (idx <= 0) {
-            line to null
-        } else {
-            line.substring(0, idx) to line.substring(idx + 2)
-        }
     }
 
     internal fun httpSucceeded(code: Int, body: String): Boolean {
@@ -226,32 +188,6 @@ object CrashKitLogEvent {
         return sb.toString()
     }
 
-    private fun causeOf(stack: String): Pair<String, String?>? {
-        for (line in stack.lineSequence()) {
-            val t = line.trim()
-            if (!t.startsWith("Caused by:")) {
-                continue
-            }
-            val body = t.removePrefix("Caused by:").trim()
-            val (cls, msg) = splitClassAndMessage(body)
-            if (cls.isNullOrEmpty()) {
-                return null
-            }
-            return cls to msg
-        }
-        return null
-    }
-
-    private fun firstAtFrame(text: String): String? {
-        for (line in text.lineSequence()) {
-            val t = line.trim()
-            if (t.startsWith("at ")) {
-                return clip(t, MSG_MAX)
-            }
-        }
-        return null
-    }
-
     private fun readBounded(file: java.io.File?, max: Int): String {
         if (file == null || !file.exists() || !file.isFile) {
             return ""
@@ -275,15 +211,6 @@ object CrashKitLogEvent {
         }
     }
 
-    private fun putExt(json: JSONObject, msgs: Array<String?>) {
-        for (i in msgs.indices) {
-            val value = msgs[i]
-            if (!value.isNullOrEmpty()) {
-                json.put("ext_data${i + 1}", value)
-            }
-        }
-    }
-
     private fun putNonBlank(json: JSONObject, key: String, value: String?) {
         if (!value.isNullOrEmpty()) {
             json.put(key, value)
@@ -303,12 +230,5 @@ object CrashKitLogEvent {
             }
         }
         return ""
-    }
-
-    private fun clip(text: String, max: Int): String {
-        if (text.length <= max) {
-            return text
-        }
-        return text.take(max)
     }
 }

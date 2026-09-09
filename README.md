@@ -1,6 +1,8 @@
 # CrashKit
 
-Android 崩溃 / ANR / OOM **采集** SDK（Kotlin + `libcrashkit.so`）。
+Android 崩溃 / ANR / OOM **采集** SDK（Kotlin + `libcrashkit.so`）。**iOS 采集 SDK 尚未实现。**
+
+端到端（Android 采集 → Android 宿主日志通道 → Metabase → 查询控制台 / 飞书播报 / AI 预诊断规划；iOS 采集与 iOS 宿主未接）见 [`docs/end-to-end-architecture.md`](docs/end-to-end-architecture.md)。
 
 - 仓库：https://github.com/hansweidong/crashkit-android.git
 - 包名：`com.yj.crashkit`
@@ -133,10 +135,14 @@ CrashKit.init(context) {
 
 从旧 `CrashReport` 迁过来时，包名改成 `com.yj.crashkit`，其余尽量同名：`CrashKit.init(new CrashKit.CrashReportBuilder()...)`（不用 `.build()`）、`setANRListener` / `startANRDetecting` / `configCrashReport` / `openSignalReport` / `addExtraInfo` / `setAppVersion`。`ILog` 用 `KitLog.ILog`；`ANRDetector.ANRListener` 改成 `AnrListener`（不要建 `ANRDetector` 类，和 `AnrDetector` 文件名冲突）。`CatonChecker.getIns().start(53)` 必须先 `CrashKitLab.enable()`。
 
-### 发布到本地 Maven
+### 发布到 Maven
 
-调试期 **不要升小版本号**。`crashkit.version` 固定，`crashkit.snapshot=true` 时产物永远是
-`1.4.5-SNAPSHOT`，反复 `publishToLocalMaven` 只覆盖同一坐标。正式发版把 `crashkit.snapshot` 改成 `false`。
+远程仓库是 [JitPack](https://jitpack.io/#hansweidong/crashkit-android)。**JitPack 只构建 git tag**（例如 `v1.4.5`）。`main-SNAPSHOT` 会在 `jitpack.yml` 里直接失败，避免路人用 JitPack 编主分支。`main` 只在你本机或你的 JitCI 上构建。不要对 `https://jitpack.io/` 跑 `./gradlew publish`。
+
+调试期 **不要升小版本号**。`crashkit.version` 固定，`crashkit.snapshot=true` 时本地产物永远是
+`1.4.5-SNAPSHOT`。正式发版把 `crashkit.snapshot` 改成 `false`，并打 tag（例如 `v1.4.5`）。
+
+本地调试：
 
 ```bash
 ./gradlew publishToLocalMaven
@@ -144,7 +150,7 @@ CrashKit.init(context) {
 
 产物：`~/.m2/repository/com/yj/crashkit/crash-core/1.4.5-SNAPSHOT/`。
 
-宿主 `settings.gradle`：
+宿主 `settings.gradle`（远程用 JitPack，调试可保留 `mavenLocal()`）：
 
 ```gradle
 dependencyResolutionManagement {
@@ -152,12 +158,16 @@ dependencyResolutionManagement {
         mavenLocal()
         google()
         mavenCentral()
+        maven { url "https://jitpack.io" }
     }
 }
 ```
 
 ```gradle
-implementation "com.yj.crashkit:crash-core:1.4.5-SNAPSHOT"
+// 远程只跟 tag，不要写 main-SNAPSHOT
+implementation "com.github.hansweidong:crashkit-android:v1.4.5"
+// 本地调试（跟 main 请用这个，不要走 JitPack）：
+// implementation "com.yj.crashkit:crash-core:1.4.5-SNAPSHOT"
 ```
 
 ### 宿主如何拿到采集结果
@@ -175,7 +185,7 @@ SDK 只采集和落盘。上报有三条路，选一条（或 sink + CrashKit �
 信封分类字段（`log_type` / `subtype` / `behavior`）可由宿主覆盖；未传时用 `CrashKitLogSession.Default`：
 
 - data 带 `sdk`、`sdk_ver`、`crash_id`、`crash_type`（JAVA_CRASH / ANR_CRASH / …）
-- data：`stack_trace`、`ext_data1-5`（类名 / message / cause / 首帧）、内存、`lan_id` / `sec_id`
+- data：`stack_trace`、`exception`、内存、`lan_id` / `sec_id`
 
 `userId`、设备 id、`lanId` 每次上报时由宿主 lambda 现取。宿主 [CrashKitLogTransport] 返回 `false` 时 pending 下次启动重投。
 
@@ -185,9 +195,9 @@ CrashKit **不发起 HTTP**。明文 `/log/live-chat` 用 `bodyAsListWrapper = f
 
 | 步 | 工程文件 | 动作 |
 |---|---|---|
-| 0 | crashkit-android | `./gradlew publishToLocalMaven`（JDK 17），产物 `1.4.5-SNAPSHOT` |
-| 1 | `settings.gradle.kts` | `dependencyResolutionManagement` 含 `mavenLocal()` |
-| 2 | `appbase/build.gradle.kts` | `implementation("com.yj.crashkit:crash-core:1.4.5-SNAPSHOT")` |
+| 0 | crashkit-android | 远程：打 tag 后走 [JitPack](https://jitpack.io/)；本地调试 `./gradlew publishToLocalMaven`（JDK 17） |
+| 1 | `settings.gradle.kts` | `dependencyResolutionManagement` 含 `maven { url = uri("https://jitpack.io") }`（调试可加 `mavenLocal()`） |
+| 2 | `appbase/build.gradle.kts` | `implementation("com.github.hansweidong:crashkit-android:v1.4.5")` |
 | 3 | `IApplication.onCreate`（主线程） | `CrashKit.init { setAppId("your-app-id") }`，此时 reporter 是 NoOp，只落盘 |
 | 4 | `CrashKitLogUpload.kt` | `setCrashKitLogUpload({ body -> logModel.submitCrashKitJson(body) }) { CrashKitLogSession(..., bodyAsListWrapper = true) }` |
 | 5 | `AppInitBizTask.AfterLaunch` | `CrashKitLogUpload.install()`，随后 ExitInfo 补报 + pending 重投 |

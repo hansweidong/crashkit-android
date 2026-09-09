@@ -64,11 +64,9 @@ class CrashKitLogEventTest {
             assertTrue(crash.getString("sdk_ver").isNotEmpty())
             assertEquals("JAVA_CRASH", crash.getString("crash_type"))
             assertEquals("id-1", crash.getString("crash_id"))
-            assertEquals("java.lang.NullPointerException", crash.getString("ext_data1"))
-            assertEquals("boom", crash.getString("ext_data2"))
-            assertEquals("java.lang.IllegalStateException", crash.getString("ext_data3"))
+            assertTrue(crash.getString("exception").contains("NullPointerException"))
             assertTrue(crash.getString("stack_trace").contains("Foo.bar"))
-            assertTrue(crash.getString("ext_data5").contains("Foo.bar"))
+            assertFalse(crash.has("ext_data1"))
         } finally {
             dump.delete()
         }
@@ -115,10 +113,8 @@ class CrashKitLogEventTest {
             val crash = event.getJSONArray("data").getJSONObject(0)
             assertEquals("crashkit", crash.getString("sdk"))
             assertEquals("ANR_CRASH", crash.getString("crash_type"))
-            assertEquals("ANR_CRASH", crash.getString("ext_data1"))
-            assertTrue(crash.getString("ext_data2").contains("----- main"))
             assertTrue(crash.getString("stack_trace").contains("DebugAnrService"))
-            assertTrue(crash.has("ext_data1"))
+            assertFalse(crash.has("ext_data1"))
         } finally {
             main.delete()
             dir.delete()
@@ -183,7 +179,8 @@ class CrashKitLogEventTest {
             assertTrue(event.getBoolean("is_in_bg"))
             assertTrue(crash.getString("stack_trace").startsWith("mem:"))
             assertTrue(crash.getString("stack_trace").contains("ram=7800"))
-            assertEquals("java.lang.OutOfMemoryError", crash.getString("ext_data1"))
+            assertTrue(crash.getString("exception").contains("OutOfMemoryError"))
+            assertFalse(crash.has("ext_data1"))
         } finally {
             dump.delete()
         }

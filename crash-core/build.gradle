@@ -22,6 +22,23 @@ def getLibraryVersion = { ->
     return base
 }
 
+//def remoteMavenRepoUrl = {
+//    def override = System.getenv("MAVEN_REPO_URL") ?: findProperty("maven.repo.url")
+//    if (override == null) {
+//        return null
+//    }
+//    def url = override.toString().trim()
+//    return url.isEmpty() ? null : url
+//}
+//
+//def remoteMavenUser = {
+//    System.getenv("MAVEN_REPO_USER") ?: System.getenv("MAVEN_USERNAME") ?: findProperty("maven.repo.user")
+//}
+//
+//def remoteMavenPassword = {
+//    System.getenv("MAVEN_REPO_PASSWORD") ?: System.getenv("MAVEN_PASSWORD") ?: findProperty("maven.repo.password")
+//}
+
 allprojects {
     group = "com.yj.crashkit"
     version = getLibraryVersion() // 统一应用版本号
@@ -106,6 +123,24 @@ afterEvaluate {
                 version = project.version
             }
         }
+//        def remoteUrl = remoteMavenRepoUrl()
+//        if (remoteUrl != null) {
+//            repositories {
+//                maven {
+//                    name = "remote"
+//                    url = uri(remoteUrl)
+//                    allowInsecureProtocol = remoteUrl.startsWith("http://")
+//                    def user = remoteMavenUser()
+//                    def pass = remoteMavenPassword()
+//                    if (user != null && !user.toString().trim().isEmpty()) {
+//                        credentials {
+//                            username = user.toString()
+//                            password = (pass != null ? pass.toString() : "")
+//                        }
+//                    }
+//                }
+//            }
+//        }
     }
     tasks.register("publishToLocalMaven") {
         group = "publishing"
