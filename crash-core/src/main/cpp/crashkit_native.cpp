@@ -22,8 +22,8 @@
 namespace {
 
 constexpr int kCrashByte = 1;
-constexpr int kWaitSlices = 30;
-constexpr int kWaitNs = 100 * 1000 * 1000;
+constexpr int kWaitSlices = 6;
+constexpr int kWaitNs = 50 * 1000 * 1000;
 constexpr int kDumpBuf = 768;
 // 必须和 Kotlin 侧 CrashFiles.NATIVE_CRASH_DUMP 一致。
 // 多进程靠 g_dump_dir 分目录隔离，所以这里可以用固定名。

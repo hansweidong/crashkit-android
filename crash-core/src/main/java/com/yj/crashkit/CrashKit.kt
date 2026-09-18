@@ -2,7 +2,6 @@ package com.yj.crashkit
 
 import android.app.Application
 import android.content.Context
-import android.os.Handler
 import android.os.Looper
 import com.yj.crashkit.anr.AnrDetector
 import com.yj.crashkit.anr.AnrListener
@@ -26,7 +25,8 @@ import com.yj.crashkit.util.KitLog
  * 采集入口。默认不含 HTTP。埋点宿主注册 [CrashTelemetrySink]；
  * CrashKit 日志协议 JSON 由 [setCrashKitLogUpload] 组好后交给宿主网络栈发送。
  *
- * 线上请只调本对象。ANR 对齐 Matrix SignalAnrTracer：SIGQUIT 旁路 + 队头/AM 确认后只上报一次，**不杀进程**。
+ * 线上请只调本对象。Java 崩溃落盘后交给系统 `KillApplicationHandler`；ANR 对齐 Matrix
+ * SignalAnrTracer：SIGQUIT 旁路 + 队头/AM 确认后只上报一次，**不杀进程**。
  * 加重诊断（主动崩溃、53ms 采样、inline 轮询、hprof）走 [CrashKitLab]。
  */
 object CrashKit {
@@ -82,7 +82,6 @@ object CrashKit {
             if (app is Application) {
                 ActivityTracker.get().install(app)
             }
-            scheduleUehRewrap()
             val nativeOk = NativeCrashBridge.install(runtime.dumpDir.absolutePath, p)
             runtime.setCatchNative(nativeOk)
             startAnrDetectorLocked(app)
@@ -306,19 +305,6 @@ object CrashKit {
             Looper.getMainLooper().thread === Thread.currentThread()
         } catch (_: Throwable) {
             false
-        }
-    }
-
-    /**
-     * 宿主常在 [init] 之后的同一个 Application.onCreate 里再装自己的 UEH。
-     * 投递到当前消息之后，把对方收成内层。
-     */
-    private fun scheduleUehRewrap() {
-        val looper = Looper.getMainLooper()
-        if (looper != null) {
-            Handler(looper).post { JavaCrashHandler.ensureOuter() }
-        } else {
-            JavaCrashHandler.ensureOuter()
         }
     }
 

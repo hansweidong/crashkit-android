@@ -17,6 +17,7 @@ import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * 崩溃主路径：pre → 落盘 → crashCallback → 三阶段 reporter → after → Blocker。
+ * 线上致命 Java 崩溃对齐 Crashlytics：后台落盘并可当场上报，崩溃线程最多等 3s/4s。
  */
 class CrashPipeline(private val runtime: CrashKitRuntime) {
     private val blocker = CrashBlocker()
@@ -33,6 +34,13 @@ class CrashPipeline(private val runtime: CrashKitRuntime) {
             return
         }
         NativeCrashBridge.markHandled()
+        val awaitMs = CrashKitOnlinePolicy.crashAwaitMs(onMainThread())
+        CrashThreadAwait.run(awaitMs) {
+            captureJava(throwable, awaitMs)
+        }
+    }
+
+    private fun captureJava(throwable: Throwable?, awaitMs: Int) {
         val tid = CrashKitRuntime.myTid()
         runtime.setCrashThreadId(tid)
         val crashId = StackTraceFormatter.newCrashId()
@@ -48,13 +56,17 @@ class CrashPipeline(private val runtime: CrashKitRuntime) {
         } else {
             DumpWriter.writeStack(runtime.dumpDir, crashId, throwable)
         }
-        val syslog = captureSyslog(type, crashId)
         val shortMsg = if (throwable == null) {
             "java crash"
         } else {
             throwable.javaClass.name + ": " + throwable.message
         }
-        runPipeline(type, crashId, dump, null, syslog, shortMsg, tid, false)
+        if (type == CrashType.JAVA_OOM || !CrashKitLab.isEnabled()) {
+            persistFatal(type, crashId, dump, shortMsg, tid, awaitMs)
+            return
+        }
+        val syslog = captureSyslog(type, crashId)
+        runPipeline(type, crashId, dump, null, syslog, shortMsg, tid, false, waitMs = awaitMs)
     }
 
     fun handleNative(dumpPath: String?) {
@@ -66,16 +78,24 @@ class CrashPipeline(private val runtime: CrashKitRuntime) {
             NativeCrashBridge.notifyJavaDone()
             return
         }
-        val crashId = StackTraceFormatter.newCrashId()
-        runtime.setCurrentCrashId(crashId)
-        runtime.setCrashThreadId(CrashKitRuntime.myTid())
-        val dump = renameDump(dumpPath, "$crashId.dmp")
-        val syslog = captureSyslog(CrashType.NATIVE_CRASH, crashId)
         try {
-            runPipeline(
-                CrashType.NATIVE_CRASH, crashId, dump, null, syslog,
-                "native crash", CrashKitRuntime.myTid(), true,
-            )
+            val crashId = StackTraceFormatter.newCrashId()
+            runtime.setCurrentCrashId(crashId)
+            runtime.setCrashThreadId(CrashKitRuntime.myTid())
+            val dump = renameDump(dumpPath, "$crashId.dmp")
+            if (CrashKitLab.isEnabled()) {
+                val syslog = captureSyslog(CrashType.NATIVE_CRASH, crashId)
+                runPipeline(
+                    CrashType.NATIVE_CRASH, crashId, dump, null, syslog,
+                    "native crash", CrashKitRuntime.myTid(), true,
+                )
+            } else {
+                persistFatal(
+                    CrashType.NATIVE_CRASH, crashId, dump,
+                    "native crash", CrashKitRuntime.myTid(),
+                    waitMs = 0,
+                )
+            }
         } finally {
             NativeCrashBridge.notifyJavaDone()
         }
@@ -175,6 +195,7 @@ class CrashPipeline(private val runtime: CrashKitRuntime) {
         nativeCrash: Boolean,
         extraLog: File? = null,
         invokeHostCallbacks: Boolean = true,
+        waitMs: Int? = null,
     ) {
         val dumpPath = path(dump)
         val symbolPath = path(symbol)
@@ -193,7 +214,9 @@ class CrashPipeline(private val runtime: CrashKitRuntime) {
         val logs = ArrayList<File>()
         addIfExists(logs, syslog)
         addIfExists(logs, extraLog)
-        if (type != CrashType.ANR_CRASH) {
+        if (type != CrashType.ANR_CRASH &&
+            (CrashKitLab.isEnabled() || !type.isFatal())
+        ) {
             for (extra in RecordInfo.dumpForCrash(runtime.dumpDir, type)) {
                 addIfExists(logs, extra)
             }
@@ -223,7 +246,34 @@ class CrashPipeline(private val runtime: CrashKitRuntime) {
             KitLog.e(TAG, "afterCrashCallback", t)
         }
 
-        val waitMs = CrashKitOnlinePolicy.blockerWaitMs(type, onMainThread())
+        val blockMs = waitMs ?: CrashKitOnlinePolicy.blockerWaitMs(type, onMainThread())
+        blocker.waitForUnblock(blockMs)
+    }
+
+    /**
+     * 致命崩溃先落盘。Java 未捕获异常在有 reporter 时当场尝试上报，
+     * 崩溃线程侧由 [CrashThreadAwait] 把总等待卡在 3s/4s。
+     * OOM 只落盘，避免在堆耗尽时再走 sink。
+     */
+    private fun persistFatal(
+        type: CrashType,
+        crashId: String,
+        dump: File?,
+        shortMsg: String,
+        tid: Int,
+        waitMs: Int,
+    ) {
+        val json = MetaJson.build(runtime, type, crashId, shortMsg, tid)
+        val dumps = ArrayList<File>()
+        addIfExists(dumps, dump)
+        val record = CrashRecord(crashId, type, json, dumps, emptyList())
+        PendingStore.save(runtime.dumpDir, record)
+        KitLog.i(TAG, "persist fatal $crashId type=$type")
+        if (type == CrashType.JAVA_OOM || waitMs <= 0 || !runtime.hasRealReporter()) {
+            return
+        }
+        blocker.preBlock(3)
+        emitAll(record, unblock = true)
         blocker.waitForUnblock(waitMs)
     }
 

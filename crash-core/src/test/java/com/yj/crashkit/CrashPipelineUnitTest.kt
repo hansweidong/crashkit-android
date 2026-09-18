@@ -58,6 +58,11 @@ class CrashPipelineUnitTest {
         assertEquals("NATIVE_CRASH", CrashType.NATIVE_CRASH.wireName())
         assertEquals("ANR_CRASH", CrashType.ANR_CRASH.wireName())
         assertEquals("JAVA_OOM", CrashType.JAVA_OOM.wireName())
+        assertTrue(CrashType.JAVA_CRASH.isFatal())
+        assertTrue(CrashType.NATIVE_CRASH.isFatal())
+        assertTrue(CrashType.JAVA_OOM.isFatal())
+        assertFalse(CrashType.ANR_CRASH.isFatal())
+        assertFalse(CrashType.JAVA_ERROR.isFatal())
     }
 
     @Test
@@ -83,16 +88,37 @@ class CrashPipelineUnitTest {
         assertTrue(policy.allowInlinePolling(true, true))
         assertEquals(0, policy.logcatLines(CrashType.JAVA_OOM, false))
         assertEquals(0, policy.logcatLines(CrashType.ANR_CRASH, false))
-        assertEquals(500, policy.logcatLines(CrashType.JAVA_CRASH, false))
-        assertEquals(200, policy.logcatLines(CrashType.JAVA_ERROR, false))
+        assertEquals(0, policy.logcatLines(CrashType.JAVA_CRASH, false))
+        assertEquals(0, policy.logcatLines(CrashType.NATIVE_CRASH, false))
+        assertEquals(0, policy.logcatLines(CrashType.JAVA_ERROR, false))
         assertEquals(2000, policy.logcatLines(CrashType.JAVA_CRASH, true))
+        assertEquals(0, policy.logcatLines(CrashType.JAVA_OOM, true))
+        assertEquals(0, policy.logcatLines(CrashType.ANR_CRASH, true))
         assertFalse(policy.shouldSampleMainThread(Long.MAX_VALUE))
         assertTrue(policy.shouldSampleMainThread(1000L))
-        assertEquals(2000, policy.blockerWaitMs(CrashType.JAVA_CRASH, true))
-        assertEquals(2000, policy.blockerWaitMs(CrashType.JAVA_OOM, false))
+        assertEquals(0, policy.blockerWaitMs(CrashType.JAVA_CRASH, true))
+        assertEquals(0, policy.blockerWaitMs(CrashType.JAVA_CRASH, false))
+        assertEquals(0, policy.blockerWaitMs(CrashType.NATIVE_CRASH, false))
+        assertEquals(0, policy.blockerWaitMs(CrashType.JAVA_OOM, false))
+        assertEquals(0, policy.blockerWaitMs(CrashType.JAVA_ERROR, true))
+        assertEquals(2000, policy.blockerWaitMs(CrashType.JAVA_ERROR, false))
         assertEquals(0, policy.blockerWaitMs(CrashType.ANR_CRASH, false))
+        assertEquals(3000, policy.crashAwaitMs(true))
+        assertEquals(4000, policy.crashAwaitMs(false))
         assertEquals(-2000L, policy.ANR_FOREGROUND_MSG_THRESHOLD_MS)
         assertEquals(40, policy.ANR_CHECK_ERROR_COUNT)
+    }
+
+    @Test
+    fun logcatCaptureSkippedWhenMaxLinesIsZero() {
+        val dir = java.io.File(System.getProperty("java.io.tmpdir"), "crashkit-logcat-${System.nanoTime()}")
+        assertTrue(dir.mkdirs())
+        try {
+            assertEquals(null, com.yj.crashkit.internal.CrashLogcat.capture(dir, "id", 0))
+            assertEquals(null, com.yj.crashkit.internal.CrashLogcat.capture(dir, "id", -1))
+        } finally {
+            dir.delete()
+        }
     }
 
     @Test
@@ -315,6 +341,19 @@ class CrashPipelineUnitTest {
         val start = System.currentTimeMillis()
         assertTrue(blocker.waitForUnblock(0))
         assertTrue("waitForUnblock(0) 阻塞了", System.currentTimeMillis() - start < 1000)
+    }
+
+    @Test
+    fun crashThreadAwaitTimesOutHungWork() {
+        val started = CountDownLatch(1)
+        val start = System.currentTimeMillis()
+        com.yj.crashkit.internal.CrashThreadAwait.run(80) {
+            started.countDown()
+            Thread.sleep(2_000)
+        }
+        assertTrue(started.await(1, TimeUnit.SECONDS))
+        val elapsed = System.currentTimeMillis() - start
+        assertTrue("await hung work elapsed=$elapsed", elapsed < 800)
     }
 
     /**

@@ -1,6 +1,5 @@
 package com.yj.crashkit.internal
 
-import android.os.Build
 import com.yj.crashkit.CrashType
 
 /**
@@ -12,6 +11,10 @@ internal object CrashKitOnlinePolicy {
     const val LAB_LOGCAT_LINES = 2000
     const val CUSTOM_LOGCAT_LINES = 200
     const val MAIN_THREAD_BLOCK_MS = 2000
+    /** 对齐 Crashlytics `Utils.MAIN_TIMEOUT_MILLIS`。 */
+    const val CRASH_AWAIT_MAIN_MS = 3_000
+    /** 对齐 Crashlytics `Utils.BACKGROUND_TIMEOUT_MILLIS`。 */
+    const val CRASH_AWAIT_BACKGROUND_MS = 4_000
     const val MAX_PENDING_FILES = 20
     const val PENDING_MAX_AGE_MS = 7L * 24 * 60 * 60 * 1000
     const val DUMP_DIR_MAX_BYTES = 64L * 1024 * 1024
@@ -68,31 +71,32 @@ internal object CrashKitOnlinePolicy {
         return inline && labEnabled
     }
 
+    /**
+     * 崩溃线程 `Runtime.exec(logcat)` 在部分机型上会挂死，线上默认不采。
+     * 需要现场日志时先 [com.yj.crashkit.CrashKitLab.enable]。
+     */
     fun logcatLines(type: CrashType, labEnabled: Boolean): Int {
+        if (!labEnabled) {
+            return 0
+        }
         if (type == CrashType.JAVA_OOM || type == CrashType.ANR_CRASH) {
             return 0
         }
-        if (labEnabled) {
-            return LAB_LOGCAT_LINES
-        }
-        if (type == CrashType.JAVA_ERROR) {
-            return CUSTOM_LOGCAT_LINES
-        }
-        return ONLINE_LOGCAT_LINES
+        return LAB_LOGCAT_LINES
+    }
+
+    fun crashAwaitMs(onMainThread: Boolean): Int {
+        return if (onMainThread) CRASH_AWAIT_MAIN_MS else CRASH_AWAIT_BACKGROUND_MS
     }
 
     fun blockerWaitMs(type: CrashType, onMainThread: Boolean): Int {
-        val full = 4000
-        if (type == CrashType.ANR_CRASH) {
+        if (type.isFatal() || type == CrashType.ANR_CRASH || onMainThread) {
             return 0
         }
-        if (type == CrashType.JAVA_ERROR || type == CrashType.JAVA_OOM) {
-            return full.coerceAtMost(2000)
+        if (type == CrashType.JAVA_ERROR) {
+            return 2000
         }
-        if (onMainThread) {
-            return MAIN_THREAD_BLOCK_MS
-        }
-        return full
+        return 4000
     }
 
     fun heavyProcDump(labEnabled: Boolean): Boolean = labEnabled

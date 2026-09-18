@@ -3,7 +3,6 @@ package com.yj.crashkit.history
 import android.app.Activity
 import android.app.Application
 import android.os.Bundle
-import com.yj.crashkit.internal.JavaCrashHandler
 import java.util.ArrayList
 
 /** 记录前后台 Activity，写入崩溃 JSON 的 history 字段。 */
@@ -31,12 +30,10 @@ class ActivityTracker private constructor() : Application.ActivityLifecycleCallb
     }
 
     override fun onActivityCreated(activity: Activity, savedInstanceState: Bundle?) {
-        JavaCrashHandler.ensureOuter()
         push(activity, 'C')
     }
 
     override fun onActivityStarted(activity: Activity) {
-        JavaCrashHandler.ensureOuter()
         started++
         isForeground = started > 0
         push(activity, 'S')

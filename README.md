@@ -31,7 +31,7 @@ CrashKit 公开 API
 | 层 | 包 / 文件 | 职责 |
 |---|---|---|
 | 公开入口 | `CrashKit.kt` / `CrashKitConfig.kt` | `init`、`setCrashKitLogUpload`、`setTelemetrySink`、`setReporter`、`setCrashCallback`、`retryPending`、`uploadCustomCrash` |
-| 采集适配 | `JavaCrashHandler` / `NativeCrashBridge` + `crashkit_native.cpp` / `AnrDetector` / `ExitInfoAnrCollector` | 装 UEH（会 rewrap）、信号 handler 只做 async-signal-safe、SIGQUIT 旁路、冷启动 ExitInfo |
+| 采集适配 | `JavaCrashHandler` / `NativeCrashBridge` + `crashkit_native.cpp` / `AnrDetector` / `ExitInfoAnrCollector` | 装 UEH（不抢最外层，落盘后交给系统 handler）、信号 handler 只做 async-signal-safe、SIGQUIT 旁路、冷启动 ExitInfo |
 | 运行时 | `internal/CrashKitRuntime.kt` | dumpDir、进程名、reporter 延迟就绪、uid / ext / userLogList |
 | 统一管线 | `internal/CrashPipeline.kt` | preCallback → 落盘 → crashCallback → pending.json → META → DUMP/LOGS → afterCallback → Blocker |
 | 现场数据 | `DumpWriter` / `OomLite` / `MetaJson` / `MemSnapshot` / `CrashLogcat` / `PendingStore` / `ActivityHistoryFormat` | 栈与 meta 落盘；内存按崩溃现场写入；Activity 压成 `Page(C:S:R)`；pending 成败由 reporter 回调决定 |
@@ -134,7 +134,7 @@ CrashKit.init(context) {
 // ANR 已随 init 打开。若要采主线程栈：CrashKit.startAnrDetecting(context, 1000L)
 ```
 
-`init` 之后宿主再 `setDefaultUncaughtExceptionHandler` 可以。CrashKit 会在当前 `onCreate` 消息结束时、以及后续 Activity 生命周期里重新包到最外层，先采集再回调宿主 handler。不要要求宿主删除自己的 UEH。
+`init` 之后宿主再 `setDefaultUncaughtExceptionHandler` 可以，而且**应该包在 CrashKit 外面**：业务只记日志，再回调 `defaultExceptionHandler`（即 CrashKit）。CrashKit **不再 rewrap 抢最外层**。致命 Java 崩溃对齐 Crashlytics：后台落盘，有 reporter 时当场尝试上报，崩溃线程最多等主线程 3s / 其它线程 4s，再把线程交给安装时记下的系统 `KillApplicationHandler`；没有上一层 handler 时 `System.exit(1)`。宿主不要 `relaunchApp` / `killProcess`。ANR 仍然只采不杀，SIGQUIT 交回系统。
 
 从旧 `CrashReport` 迁过来时，包名改成 `com.yj.crashkit`，其余尽量同名：`CrashKit.init(new CrashKit.CrashReportBuilder()...)`（不用 `.build()`）、`setANRListener` / `startANRDetecting` / `configCrashReport` / `openSignalReport` / `addExtraInfo` / `setAppVersion`。`ILog` 用 `KitLog.ILog`；`ANRDetector.ANRListener` 改成 `AnrListener`（不要建 `ANRDetector` 类，和 `AnrDetector` 文件名冲突）。`CatonChecker.getIns().start(53)` 必须先 `CrashKitLab.enable()`。
 

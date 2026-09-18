@@ -6,6 +6,9 @@ package com.yj.crashkit
  * SDK 在 `preCallback → 落盘 → crashCallback` 之后、进程可能被系统杀掉之前，
  * 在**当前采集线程**调用一次 [onTelemetry]。不会再为 DUMP / LOGS 回调本接口。
  *
+ * 线上 Java / Native / OOM 未捕获崩溃不会在濒死线程回调本接口，只把记录写入 pending，
+ * 等宿主 [CrashKit.retryPending]。ANR、自定义错误、以及 [CrashKitLab] 仍走本回调。
+ *
  * 宿主应尽快把 [CrashTelemetryPayload.wireText] 交给埋点 SDK 并返回；
  * 不要在这里读大文件或做网络（除非埋点 SDK 自身是异步的）。
  */
